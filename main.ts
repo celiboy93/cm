@@ -15,12 +15,6 @@ const ALLOWED_ENTRY_HOSTS = new Set([
   "pyazzindex-production.up.railway.app",
 ]);
 
-// pyazz.com အလုပ်လုပ်ဖို့လိုတဲ့ external dependency hosts
-const PYAZZ_CONTEXT_EXTRA_HOSTS = new Set([
-  "api.themoviedb.org",
-  "image.tmdb.org",
-]);
-
 // ===== Short-lived caches =====
 const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 const MEDIA_RESOLVE_CACHE_TTL_MS = 15 * 1000; // 15 seconds
@@ -110,7 +104,6 @@ async function handler(req: Request): Promise<Response> {
 
     const isMedia = looksLikeMediaRequest(targetUrl, req);
 
-    // ===== HTML detail cache =====
     if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
       const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin || targetUrl.origin);
       const cached = detailHtmlCache.get(cacheKey);
@@ -364,6 +357,18 @@ function isTempMediaHost(hostname: string): boolean {
   return h.endsWith(".r2.dev") || h.endsWith(".r2.cloudflarestorage.com");
 }
 
+function isTopLevelDocumentRequest(req: Request): boolean {
+  const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
+  const mode = (req.headers.get("sec-fetch-mode") || "").toLowerCase();
+  const accept = (req.headers.get("accept") || "").toLowerCase();
+
+  return (
+    dest === "document" ||
+    mode === "navigate" ||
+    accept.includes("text/html")
+  );
+}
+
 function isAllowedTarget(
   targetUrl: URL,
   req: Request,
@@ -372,9 +377,16 @@ function isAllowedTarget(
   const host = targetUrl.hostname.toLowerCase();
 
   if (ALLOWED_ENTRY_HOSTS.has(host)) return true;
-  if (pyazzContext && PYAZZ_CONTEXT_EXTRA_HOSTS.has(host)) return true;
+
   if (pyazzContext && looksLikeMediaRequest(targetUrl, req) && isTempMediaHost(host)) {
     return true;
+  }
+
+  if (pyazzContext) {
+    if (isTopLevelDocumentRequest(req)) {
+      return false;
+    }
+    return targetUrl.protocol === "https:";
   }
 
   return false;
@@ -569,6 +581,16 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
   );
 }
 
+function filterOutgoingCookie(cookieHeader: string): string {
+  const parts = cookieHeader
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((pair) => !pair.startsWith(`${TARGET_COOKIE}=`));
+
+  return parts.join("; ");
+}
+
 function buildUpstreamHeaders(
   req: Request,
   targetUrl: URL,
@@ -616,7 +638,10 @@ function buildUpstreamHeaders(
   }
 
   const cookie = req.headers.get("cookie");
-  if (cookie) h.set("cookie", cookie);
+  if (cookie) {
+    const filtered = filterOutgoingCookie(cookie);
+    if (filtered) h.set("cookie", filtered);
+  }
 
   return h;
 }
