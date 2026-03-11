@@ -18,7 +18,7 @@ const ALLOWED_ENTRY_HOSTS = new Set([
 
 // ===== Short-lived caches =====
 const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000;
-const MEDIA_RESOLVE_CACHE_TTL_MS = 15 * 1000;
+const MEDIA_RESOLVE_CACHE_TTL_MS = 3 * 1000;
 
 type DetailCacheEntry = {
   expiresAt: number;
@@ -268,11 +268,12 @@ async function fetchUpstreamWithRetry(
 ): Promise<{ upstream: Response; effectiveTargetUrl: URL }> {
   const isMedia = looksLikeMediaRequest(originalTargetUrl, req);
   const resolveKey = makeResolveCacheKey(originalTargetUrl.href, cookieOrigin);
+  const bypassResolvedCache = shouldBypassResolvedMediaCache(originalTargetUrl);
 
   let effectiveTargetUrl = originalTargetUrl;
   let usedCachedResolve = false;
 
-  if (req.method === "GET" && isMedia) {
+  if (req.method === "GET" && isMedia && !bypassResolvedCache) {
     const cachedResolve = mediaResolveCache.get(resolveKey);
     if (cachedResolve && cachedResolve.expiresAt > Date.now()) {
       try {
@@ -282,6 +283,8 @@ async function fetchUpstreamWithRetry(
         mediaResolveCache.delete(resolveKey);
       }
     }
+  } else if (bypassResolvedCache) {
+    mediaResolveCache.delete(resolveKey);
   }
 
   try {
@@ -293,7 +296,13 @@ async function fetchUpstreamWithRetry(
       upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
     }
 
-    if (req.method === "GET" && isMedia) {
+    if (isMedia && !usedCachedResolve && shouldRetryMediaStatus(upstream.status)) {
+      mediaResolveCache.delete(resolveKey);
+      effectiveTargetUrl = originalTargetUrl;
+      upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
+    }
+
+    if (req.method === "GET" && isMedia && upstream.ok) {
       mediaResolveCache.set(resolveKey, {
         expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
         finalUrl: upstream.url || effectiveTargetUrl.href,
@@ -301,21 +310,34 @@ async function fetchUpstreamWithRetry(
     }
 
     return { upstream, effectiveTargetUrl };
-  } catch (e) {
-    if (isMedia && usedCachedResolve) {
+  } catch (_e) {
+    if (isMedia) {
       mediaResolveCache.delete(resolveKey);
       effectiveTargetUrl = originalTargetUrl;
       const upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
 
-      mediaResolveCache.set(resolveKey, {
-        expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
-        finalUrl: upstream.url || effectiveTargetUrl.href,
-      });
+      if (upstream.ok) {
+        mediaResolveCache.set(resolveKey, {
+          expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
+          finalUrl: upstream.url || effectiveTargetUrl.href,
+        });
+      }
 
       return { upstream, effectiveTargetUrl };
     }
-    throw e;
+    throw _e;
   }
+}
+
+function shouldBypassResolvedMediaCache(url: URL): boolean {
+  const h = url.hostname.toLowerCase();
+  const p = url.pathname.toLowerCase();
+
+  return (
+    h.includes("railway.app") ||
+    h.includes("pyazzindex-production.up.railway.app") ||
+    p.includes("/d/")
+  );
 }
 
 async function doFetch(
@@ -821,19 +843,32 @@ function injectedScript(
 (function(){
 'use strict';
 
+var UNSUPPORTED_PATHS = ['/tvshow', '/adults', '/review', '/trends'];
+
+function isUnsupportedLocalPath(path){
+  try{
+    var s = String(path || '').trim().toLowerCase();
+    for(var i=0;i<UNSUPPORTED_PATHS.length;i++){
+      var p = UNSUPPORTED_PATHS[i];
+      if(s === p || s.indexOf(p + '?') === 0 || s.indexOf(p + '#') === 0) return true;
+    }
+  }catch(e){}
+  return false;
+}
+
 function shouldIgnoreDebugUrl(url){
   try{
     var s = String(url || '');
 
     if(/google-analytics\\.com|googletagmanager\\.com/i.test(s)) return true;
 
-    var selfProxyPrefix1 = location.origin + '/proxy/' + location.origin + '/video/';
-    var selfProxyPrefix2 = location.origin + '/proxy/https://' + location.host + '/video/';
-    var selfProxyPrefix3 = location.origin + '/proxy/http://' + location.host + '/video/';
+    var p1 = location.origin + '/proxy/https://' + location.host + '/';
+    var p2 = location.origin + '/proxy/http://' + location.host + '/';
+    var p3 = location.origin + '/proxy/' + location.origin + '/';
 
-    if(s.indexOf(selfProxyPrefix1) === 0) return true;
-    if(s.indexOf(selfProxyPrefix2) === 0) return true;
-    if(s.indexOf(selfProxyPrefix3) === 0) return true;
+    if(s.indexOf(p1) === 0) return true;
+    if(s.indexOf(p2) === 0) return true;
+    if(s.indexOf(p3) === 0) return true;
 
     return false;
   }catch(e){
@@ -968,6 +1003,34 @@ function isMediaLike(u){
   );
 }
 
+function unwrapSelfProxyUrl(u){
+  try{
+    var s = String(u || '').trim();
+    var forms = [
+      location.origin + '/proxy/https://' + location.host,
+      location.origin + '/proxy/http://' + location.host,
+      '/proxy/https://' + location.host,
+      '/proxy/http://' + location.host
+    ];
+
+    for(var i=0;i<forms.length;i++){
+      if(s.indexOf(forms[i]) === 0){
+        var tail = s.substring(forms[i].length);
+        if(!tail.startsWith('/')) tail = '/' + tail;
+
+        if(isUnsupportedLocalPath(tail)) return '#';
+
+        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(tail)){
+          return tail;
+        }
+
+        return PROXY_BASE + TARGET_ORIGIN + tail;
+      }
+    }
+  }catch(e){}
+  return null;
+}
+
 function toLocalProxyRoute(u){
   try{
     if(typeof u !== 'string') return u;
@@ -995,11 +1058,27 @@ function toLocalProxyRoute(u){
   return null;
 }
 
+function addRetryParam(url){
+  try{
+    var u = new URL(url, location.href);
+    u.searchParams.set('_pvretry', String(Date.now()));
+    return u.href;
+  }catch(e){
+    var sep = String(url).indexOf('?') === -1 ? '?' : '&';
+    return String(url) + sep + '_pvretry=' + Date.now();
+  }
+}
+
 function proxify(u){
   if(!u || typeof u !== 'string') return u;
   u = u.trim();
 
   if(/^(javascript:|data:|blob:|#|about:|mailto:|tel:)/i.test(u)) return u;
+
+  if(isUnsupportedLocalPath(u)) return '#';
+
+  var selfFixed = unwrapSelfProxyUrl(u);
+  if(selfFixed !== null) return selfFixed;
 
   var localRoute = toLocalProxyRoute(u);
   if(localRoute) return localRoute;
@@ -1009,13 +1088,16 @@ function proxify(u){
 
   try{
     var parsedDirect = new URL(u);
-    var route = parsedDirect.pathname + parsedDirect.search + parsedDirect.hash;
+    var directRoute = parsedDirect.pathname + parsedDirect.search + parsedDirect.hash;
 
-    if(
-      parsedDirect.origin === location.origin &&
-      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
-    ){
-      return route;
+    if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') !== 0){
+      if(isUnsupportedLocalPath(directRoute)) return '#';
+
+      if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(directRoute)){
+        return directRoute;
+      }
+
+      return PROXY_BASE + TARGET_ORIGIN + directRoute;
     }
 
     if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') === 0){
@@ -1034,6 +1116,8 @@ function proxify(u){
       var parsedAbs = new URL(abs);
       var route2 = parsedAbs.pathname + parsedAbs.search + parsedAbs.hash;
 
+      if(isUnsupportedLocalPath(route2)) return '#';
+
       if(
         parsedAbs.origin === TARGET_ORIGIN &&
         /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
@@ -1041,11 +1125,11 @@ function proxify(u){
         return route2;
       }
 
-      if(
-        parsedAbs.origin === location.origin &&
-        /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
-      ){
-        return route2;
+      if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') !== 0){
+        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)){
+          return route2;
+        }
+        return PROXY_BASE + TARGET_ORIGIN + route2;
       }
 
       if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') === 0){
@@ -1072,6 +1156,103 @@ function rewriteSrcset(v){
   }catch(e){
     return v;
   }
+}
+
+function hideUnsupportedTabs(root){
+  try{
+    var links = [];
+
+    if(root && root.tagName === 'A'){
+      links.push(root);
+    }
+
+    try{
+      var found = (root && root.querySelectorAll ? root : document).querySelectorAll('a');
+      for(var i=0;i<found.length;i++) links.push(found[i]);
+    }catch(e){}
+
+    for(var j=0;j<links.length;j++){
+      var a = links[j];
+      if(!a || a.getAttribute('data-proxy-hidden') === '1') continue;
+
+      var raw = (a.getAttribute('href') || '').trim();
+      var txt = (a.textContent || '').trim().toLowerCase();
+
+      var shouldHide =
+        isUnsupportedLocalPath(raw) ||
+        /\\/(tvshow|adults|review|trends)(?:[?#]|$)/i.test(raw) ||
+        txt === 'tv show' ||
+        txt === 'adults' ||
+        txt === 'review' ||
+        txt === 'trends';
+
+      if(shouldHide){
+        a.setAttribute('data-proxy-hidden', '1');
+        a.style.display = 'none';
+        a.removeAttribute('href');
+      }
+    }
+  }catch(e){}
+}
+
+function patchVideoElements(root){
+  try{
+    var vids = [];
+
+    if(root && root.tagName === 'VIDEO'){
+      vids.push(root);
+    }
+
+    try{
+      var found = (root && root.querySelectorAll ? root : document).querySelectorAll('video');
+      for(var i=0;i<found.length;i++) vids.push(found[i]);
+    }catch(e){}
+
+    for(var j=0;j<vids.length;j++){
+      var v = vids[j];
+      if(!v || v.__proxyPatched) continue;
+      v.__proxyPatched = true;
+
+      (function(video){
+        var retries = 0;
+        var timer = 0;
+
+        function retry(){
+          if(retries >= 2) return;
+          retries++;
+
+          clearTimeout(timer);
+          timer = setTimeout(function(){
+            try{
+              var src = video.currentSrc || video.getAttribute('src') || '';
+              var source = !src ? video.querySelector('source[src]') : null;
+              if(!src && source) src = source.getAttribute('src') || '';
+              if(!src) return;
+
+              var next = addRetryParam(src);
+
+              if(source){
+                source.setAttribute('src', next);
+                if(video.getAttribute('src')) video.removeAttribute('src');
+              }else{
+                video.setAttribute('src', next);
+              }
+
+              video.load();
+              var p = video.play && video.play();
+              if(p && p.catch) p.catch(function(){});
+            }catch(e){}
+          }, retries === 1 ? 800 : 1800);
+        }
+
+        video.addEventListener('error', retry);
+        video.addEventListener('stalled', retry);
+        video.addEventListener('emptied', retry);
+        video.addEventListener('abort', retry);
+        video.addEventListener('loadeddata', function(){ retries = 0; });
+      })(v);
+    }
+  }catch(e){}
 }
 
 persistTargetOrigin();
@@ -1222,6 +1403,12 @@ document.addEventListener('click', function(e){
     if(target === '_blank') return;
 
     if(href && !/^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href.trim())){
+      if(isUnsupportedLocalPath(href)){
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       persistTargetOrigin();
@@ -1274,6 +1461,10 @@ function rewriteNode(el){
 
 function rewriteTree(root){
   if(!root) return;
+
+  hideUnsupportedTabs(root);
+  patchVideoElements(root);
+
   rewriteNode(root);
   try{
     var els = root.querySelectorAll('[src],[href],[action],[poster],[srcset]');
@@ -1281,6 +1472,9 @@ function rewriteTree(root){
       rewriteNode(els[i]);
     }
   }catch(e){}
+
+  hideUnsupportedTabs(root);
+  patchVideoElements(root);
 }
 
 var mo = new MutationObserver(function(muts){
@@ -1306,17 +1500,24 @@ if(document.documentElement){
 if(document.readyState === 'loading'){
   document.addEventListener('DOMContentLoaded', function(){
     persistTargetOrigin();
+    hideUnsupportedTabs(document);
+    patchVideoElements(document);
     rewriteTree(document.documentElement);
   });
 }else{
   persistTargetOrigin();
+  hideUnsupportedTabs(document);
+  patchVideoElements(document);
   rewriteTree(document.documentElement);
 }
 
 window.addEventListener('load', function(){
   persistTargetOrigin();
+  hideUnsupportedTabs(document);
+  patchVideoElements(document);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
+  setTimeout(function(){ hideUnsupportedTabs(document); patchVideoElements(document); }, 1600);
 });
 
 try{
