@@ -56,11 +56,12 @@ async function handler(req: Request): Promise<Response> {
     }
 
     const upstreamHeaders = buildUpstreamHeaders(req, targetUrl);
+    const isMedia = looksLikeMediaRequest(targetUrl, req);
 
     const init: RequestInit = {
       method: req.method,
       headers: upstreamHeaders,
-      redirect: "manual",
+      redirect: isMedia ? "follow" : "manual",
     };
 
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -73,8 +74,7 @@ async function handler(req: Request): Promise<Response> {
     const contentType = upstream.headers.get("content-type") || "";
     const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
 
-    // redirect handling
-    if ([301, 302, 303, 307, 308].includes(upstream.status)) {
+    if (!isMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
       const loc = upstream.headers.get("location");
       if (loc) {
         const abs = new URL(loc, targetUrl.href).href;
@@ -83,7 +83,7 @@ async function handler(req: Request): Promise<Response> {
 
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(null, {
@@ -92,14 +92,13 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    // HTML
     if (contentType.includes("text/html")) {
       let html = await upstream.text();
       html = rewriteHtml(
         html,
         targetUrl.href,
         proxyOrigin + PROXY_PREFIX,
-        targetUrl.origin,
+        getCookie(req, TARGET_COOKIE) || targetUrl.origin,
       );
 
       outHeaders.delete("content-length");
@@ -107,7 +106,7 @@ async function handler(req: Request): Promise<Response> {
       outHeaders.set("content-type", "text/html; charset=utf-8");
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(html, {
@@ -116,7 +115,6 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    // CSS
     if (contentType.includes("text/css")) {
       let css = await upstream.text();
       css = rewriteCss(css, targetUrl.href, proxyOrigin + PROXY_PREFIX);
@@ -131,7 +129,6 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    // JS -> pass through
     if (
       contentType.includes("javascript") ||
       contentType.includes("application/javascript") ||
@@ -140,7 +137,7 @@ async function handler(req: Request): Promise<Response> {
     ) {
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(upstream.body, {
@@ -149,7 +146,6 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    // JSON
     if (
       contentType.includes("application/json") ||
       contentType.includes("+json")
@@ -159,7 +155,7 @@ async function handler(req: Request): Promise<Response> {
       outHeaders.delete("content-encoding");
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(txt, {
@@ -168,10 +164,9 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    // binary / media / stream
     outHeaders.append(
       "set-cookie",
-      `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+      `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
     );
 
     return new Response(upstream.body, {
@@ -202,7 +197,6 @@ function extractTargetUrl(req: Request, url: URL): string {
     return url.searchParams.get("url") || "";
   }
 
-  // local proxy app routes like /video/<uuid>
   if (url.pathname !== "/") {
     const refererOrigin = inferOriginFromReferer(req);
     if (refererOrigin) {
@@ -325,10 +319,28 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
+function looksLikeMediaRequest(url: URL, req: Request): boolean {
+  const path = url.pathname.toLowerCase();
+  const host = url.hostname.toLowerCase();
+  const accept = (req.headers.get("accept") || "").toLowerCase();
+
+  return (
+    path.endsWith(".mp4") ||
+    path.endsWith(".m3u8") ||
+    path.endsWith(".mkv") ||
+    path.endsWith(".webm") ||
+    path.endsWith(".ts") ||
+    path.includes("/d/") ||
+    host.includes("r2.dev") ||
+    host.includes("railway.app") ||
+    accept.includes("video/") ||
+    accept.includes("application/octet-stream")
+  );
+}
+
 function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
   const h = new Headers();
 
-  h.set("host", targetUrl.host);
   h.set(
     "user-agent",
     req.headers.get("user-agent") ||
@@ -339,10 +351,15 @@ function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
     "accept-language",
     req.headers.get("accept-language") || "en-US,en;q=0.9",
   );
-
   h.set("accept-encoding", "identity");
-  h.set("referer", targetUrl.origin + "/");
-  h.set("origin", targetUrl.origin);
+
+  const cookieOrigin = getCookie(req, TARGET_COOKIE) || "";
+  const refererBase = /^https?:\/\//i.test(cookieOrigin)
+    ? cookieOrigin
+    : targetUrl.origin;
+
+  h.set("referer", refererBase + "/");
+  h.set("origin", refererBase);
 
   const passHeaders = [
     "content-type",
@@ -592,6 +609,19 @@ function isAppRoute(u){
   return /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(u.trim());
 }
 
+function isMediaLike(u){
+  if(!u || typeof u !== 'string') return false;
+  u = u.toLowerCase();
+  return (
+    u.indexOf('/d/') !== -1 ||
+    u.indexOf('.mp4') !== -1 ||
+    u.indexOf('.m3u8') !== -1 ||
+    u.indexOf('.ts') !== -1 ||
+    u.indexOf('r2.dev') !== -1 ||
+    u.indexOf('railway.app') !== -1
+  );
+}
+
 function toLocalProxyRoute(u){
   try{
     if(typeof u !== 'string') return u;
@@ -626,6 +656,10 @@ function proxify(u){
 
   try{
     var abs = new URL(u, currentTargetPage()).href;
+
+    if(isMediaLike(abs)){
+      return PROXY_BASE + abs;
+    }
 
     try{
       var parsedAbs = new URL(abs);
@@ -876,7 +910,7 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz route-fix active');
+console.log('[Proxy] pyazz media-follow fix active');
 })();
 <\/script>`;
 }
@@ -923,7 +957,7 @@ small{display:block;margin-top:12px;color:#94a3b8}
 <body>
 <div class="box">
   <h1>Deno Proxy</h1>
-  <p>pyazz.com အတွက် detail route fix ပါတဲ့ proxy</p>
+  <p>pyazz.com အတွက် detail + media follow fix ပါတဲ့ proxy</p>
   <form onsubmit="go(event)">
     <input id="u" type="text" placeholder="https://pyazz.com" required>
     <button type="submit">Browse</button>
