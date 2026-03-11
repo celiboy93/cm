@@ -360,7 +360,6 @@ function isTempMediaHost(hostname: string): boolean {
 function isTopLevelDocumentRequest(req: Request): boolean {
   const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
   const mode = (req.headers.get("sec-fetch-mode") || "").toLowerCase();
-
   return dest === "document" || mode === "navigate";
 }
 
@@ -835,6 +834,89 @@ function injectedScript(
 (function(){
 'use strict';
 
+function createDebugBox(){
+  try{
+    if(document.getElementById('__proxy_debug_box')) return;
+
+    var box = document.createElement('div');
+    box.id = '__proxy_debug_box';
+    box.style.position = 'fixed';
+    box.style.left = '8px';
+    box.style.right = '8px';
+    box.style.bottom = '8px';
+    box.style.zIndex = '999999';
+    box.style.maxHeight = '35vh';
+    box.style.overflow = 'auto';
+    box.style.background = 'rgba(0,0,0,0.92)';
+    box.style.color = '#fff';
+    box.style.fontSize = '12px';
+    box.style.lineHeight = '1.4';
+    box.style.padding = '10px';
+    box.style.border = '1px solid rgba(255,255,255,0.2)';
+    box.style.borderRadius = '10px';
+    box.style.wordBreak = 'break-word';
+    box.style.display = 'none';
+
+    var title = document.createElement('div');
+    title.textContent = 'Proxy Debug';
+    title.style.fontWeight = '700';
+    title.style.marginBottom = '6px';
+    box.appendChild(title);
+
+    var closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    closeBtn.style.position = 'absolute';
+    closeBtn.style.top = '6px';
+    closeBtn.style.right = '8px';
+    closeBtn.style.background = 'transparent';
+    closeBtn.style.color = '#fff';
+    closeBtn.style.border = 'none';
+    closeBtn.style.fontSize = '18px';
+    closeBtn.onclick = function(){ box.style.display = 'none'; };
+    box.appendChild(closeBtn);
+
+    var content = document.createElement('div');
+    content.id = '__proxy_debug_content';
+    box.appendChild(content);
+
+    document.documentElement.appendChild(box);
+  }catch(e){}
+}
+
+function reportFail(type, url, extra){
+  try{
+    createDebugBox();
+    var box = document.getElementById('__proxy_debug_box');
+    var content = document.getElementById('__proxy_debug_content');
+    if(!box || !content) return;
+
+    box.style.display = 'block';
+
+    var item = document.createElement('div');
+    item.style.padding = '6px 0';
+    item.style.borderTop = '1px solid rgba(255,255,255,0.12)';
+
+    var t = document.createElement('div');
+    t.style.color = '#ff8080';
+    t.style.fontWeight = '700';
+    t.textContent = type;
+    item.appendChild(t);
+
+    var u = document.createElement('div');
+    u.textContent = url || '(no url)';
+    item.appendChild(u);
+
+    if(extra){
+      var e = document.createElement('div');
+      e.style.color = '#ccc';
+      e.textContent = extra;
+      item.appendChild(e);
+    }
+
+    content.prepend(item);
+  }catch(e){}
+}
+
 var PROXY_BASE = ${JSON.stringify(proxyBase)};
 var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
 var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
@@ -954,31 +1036,75 @@ persistTargetOrigin();
 try{
   var originalFetch = window.fetch;
   window.fetch = function(input, init){
+    var finalUrl = '';
     try{
       if(typeof input === 'string'){
-        input = proxify(input);
+        finalUrl = proxify(input);
+        input = finalUrl;
       }else if(input && typeof input === 'object'){
         var u = input.url || input.href || '';
         if(u){
-          input = new Request(proxify(u), input);
+          finalUrl = proxify(u);
+          input = new Request(finalUrl, input);
         }
       }
     }catch(e){}
     persistTargetOrigin();
-    return originalFetch.call(this, input, init);
+
+    return originalFetch.call(this, input, init).then(function(res){
+      try{
+        var showUrl = res && res.url ? res.url : finalUrl;
+        if(!res.ok){
+          reportFail('FETCH FAIL ' + res.status, showUrl, res.statusText || '');
+        }
+      }catch(e){}
+      return res;
+    }).catch(function(err){
+      reportFail('FETCH ERROR', finalUrl, String(err));
+      throw err;
+    });
   };
 }catch(e){}
 
 try{
   var originalXhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(){
-    if(arguments.length >= 2 && typeof arguments[1] === 'string'){
-      arguments[1] = proxify(arguments[1]);
+  XMLHttpRequest.prototype.open = function(method, url){
+    var finalUrl = url;
+    if(typeof url === 'string'){
+      finalUrl = proxify(url);
+      arguments[1] = finalUrl;
     }
+
+    this.addEventListener('load', function(){
+      try{
+        if(this.status >= 400){
+          reportFail('XHR FAIL ' + this.status, finalUrl, this.statusText || '');
+        }
+      }catch(e){}
+    });
+
+    this.addEventListener('error', function(){
+      reportFail('XHR ERROR', finalUrl, 'network error');
+    });
+
     persistTargetOrigin();
     return originalXhrOpen.apply(this, arguments);
   };
 }catch(e){}
+
+window.addEventListener('error', function(e){
+  try{
+    reportFail('WINDOW ERROR', e.filename || '', e.message || '');
+  }catch(err){}
+});
+
+window.addEventListener('unhandledrejection', function(e){
+  try{
+    var msg = '';
+    try{ msg = String(e.reason); }catch(_) {}
+    reportFail('PROMISE ERROR', '', msg);
+  }catch(err){}
+});
 
 try{
   var pushState = history.pushState;
