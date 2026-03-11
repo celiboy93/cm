@@ -1199,48 +1199,56 @@ function hideUnsupportedTabs(root){
 
 function decoratePosterTitles(root){
   try{
-    var imgs = [];
-
-    if(root && root.tagName === 'IMG'){
-      imgs.push(root);
-    }
-
+    // အရင်ထည့်ထားတဲ့ title အဟောင်းတွေကိုဖျက်
     try{
-      var found = (root && root.querySelectorAll ? root : document).querySelectorAll('img[alt]');
-      for(var i=0;i<found.length;i++) imgs.push(found[i]);
+      var olds = document.querySelectorAll('.__proxy_poster_title');
+      for(var x=0;x<olds.length;x++){
+        olds[x].remove();
+      }
     }catch(e){}
 
-    for(var j=0;j<imgs.length;j++){
-      var img = imgs[j];
-      if(!img || img.getAttribute('data-proxy-title-done') === '1') continue;
-      img.setAttribute('data-proxy-title-done', '1');
+    var links = [];
+    try{
+      var found = (root && root.querySelectorAll ? root : document).querySelectorAll('a[href^="/video/"]');
+      for(var i=0;i<found.length;i++) links.push(found[i]);
+    }catch(e){}
 
-      var alt = (img.getAttribute('alt') || '').trim();
-      if(!alt) continue;
-      if(/logo|banner|advert|icon|avatar|profile|search/i.test(alt)) continue;
+    for(var j=0;j<links.length;j++){
+      var a = links[j];
+      if(!a) continue;
 
-      var anchor = img.closest && img.closest('a');
-      if(!anchor) continue;
+      var img = null;
+      try{
+        img = a.querySelector('img');
+      }catch(e){}
+      if(!img) continue;
 
-      var parent = anchor.parentElement;
-      if(!parent) continue;
-      if(parent.querySelector('.__proxy_poster_title')) continue;
+      var title = (img.getAttribute('alt') || img.getAttribute('title') || '').trim();
+      if(!title) continue;
 
-      var box = document.createElement('div');
-      box.className = '__proxy_poster_title';
-      box.textContent = alt;
-      box.style.fontSize = '12px';
-      box.style.lineHeight = '1.3';
-      box.style.color = '#e5e7eb';
-      box.style.marginTop = '6px';
-      box.style.display = '-webkit-box';
-      box.style.webkitLineClamp = '2';
-      box.style.webkitBoxOrient = 'vertical';
-      box.style.overflow = 'hidden';
-      box.style.wordBreak = 'break-word';
+      if(/logo|banner|advert|icon|avatar|profile|search/i.test(title)) continue;
+
+      // anchor အောက်မှာ label တစ်ခုပဲထည့်
+      var next = a.nextElementSibling;
+      if(next && next.classList && next.classList.contains('__proxy_poster_title')){
+        continue;
+      }
+
+      var label = document.createElement('div');
+      label.className = '__proxy_poster_title';
+      label.textContent = title;
+      label.style.fontSize = '12px';
+      label.style.marginTop = '6px';
+      label.style.color = '#e5e7eb';
+      label.style.lineHeight = '1.3';
+      label.style.display = 'block';
+      label.style.textAlign = 'center';
+      label.style.whiteSpace = 'nowrap';
+      label.style.overflow = 'hidden';
+      label.style.textOverflow = 'ellipsis';
 
       try{
-        parent.appendChild(box);
+        a.insertAdjacentElement('afterend', label);
       }catch(e){}
     }
   }catch(e){}
