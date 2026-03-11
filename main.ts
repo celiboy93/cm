@@ -3,7 +3,7 @@ const PORT = 8000;
 const PROXY_PREFIX = "/proxy/";
 const TARGET_COOKIE = "__proxy_target_origin";
 
-// ===== pyazz-only allowlist =====
+// ===== pyazz-only config =====
 const PYAZZ_ORIGINS = new Set([
   "https://pyazz.com",
   "https://www.pyazz.com",
@@ -13,6 +13,12 @@ const ALLOWED_ENTRY_HOSTS = new Set([
   "pyazz.com",
   "www.pyazz.com",
   "pyazzindex-production.up.railway.app",
+]);
+
+// pyazz.com အလုပ်လုပ်ဖို့လိုတဲ့ external dependency hosts
+const PYAZZ_CONTEXT_EXTRA_HOSTS = new Set([
+  "api.themoviedb.org",
+  "image.tmdb.org",
 ]);
 
 // ===== Short-lived caches =====
@@ -104,9 +110,11 @@ async function handler(req: Request): Promise<Response> {
 
     const isMedia = looksLikeMediaRequest(targetUrl, req);
 
+    // ===== HTML detail cache =====
     if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
       const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin || targetUrl.origin);
       const cached = detailHtmlCache.get(cacheKey);
+
       if (cached && cached.expiresAt > Date.now()) {
         const h = new Headers(cached.headers);
         h.set("content-type", "text/html; charset=utf-8");
@@ -115,6 +123,7 @@ async function handler(req: Request): Promise<Response> {
           "set-cookie",
           `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin || targetUrl.origin)}; Path=/; SameSite=Lax`,
         );
+
         return new Response(cached.body, {
           status: cached.status,
           headers: h,
@@ -286,11 +295,7 @@ async function fetchUpstreamWithRetry(
   try {
     let upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
 
-    if (
-      isMedia &&
-      usedCachedResolve &&
-      shouldRetryMediaStatus(upstream.status)
-    ) {
+    if (isMedia && usedCachedResolve && shouldRetryMediaStatus(upstream.status)) {
       mediaResolveCache.delete(resolveKey);
       effectiveTargetUrl = originalTargetUrl;
       upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
@@ -367,7 +372,7 @@ function isAllowedTarget(
   const host = targetUrl.hostname.toLowerCase();
 
   if (ALLOWED_ENTRY_HOSTS.has(host)) return true;
-
+  if (pyazzContext && PYAZZ_CONTEXT_EXTRA_HOSTS.has(host)) return true;
   if (pyazzContext && looksLikeMediaRequest(targetUrl, req) && isTempMediaHost(host)) {
     return true;
   }
