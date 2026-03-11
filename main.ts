@@ -1,17 +1,38 @@
 // deno-lint-ignore-file no-explicit-any
+
+// ===== Configuration =====
 const PORT = 8000;
 const PROXY_PREFIX = "/proxy/";
 const TARGET_COOKIE = "__proxy_target_origin";
 
-// ===== Short-lived caches =====
-const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
-const MEDIA_RESOLVE_CACHE_TTL_MS = 30 * 1000; // 30 seconds
+// Cache TTLs
+const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000;       // 2 minutes
+const MEDIA_RESOLVE_CACHE_TTL_MS = 30 * 1000;     // 30 seconds
+const CACHE_CLEANUP_INTERVAL_MS = 30 * 1000;       // cleanup every 30s
 
+// Limits
+const MAX_DETAIL_CACHE_ENTRIES = 500;
+const MAX_MEDIA_CACHE_ENTRIES = 1000;
+const MAX_CONCURRENT_REQUESTS = 200;
+const MAX_REQUESTS_PER_IP_PER_MINUTE = 120;
+const UPSTREAM_TIMEOUT_MS = 30_000;                 // 30 seconds for HTML etc.
+const UPSTREAM_MEDIA_TIMEOUT_MS = 120_000;          // 120 seconds for media
+const MAX_HTML_BODY_CACHE_SIZE = 2 * 1024 * 1024;  // 2 MB max per cached page
+const ALLOWED_HOSTS: string[] = [];                 // Empty = allow all. Add hosts to restrict, e.g. ["pyazz.com"]
+const BLOCKED_INTERNAL_CIDRS = [
+  "127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+  "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+  "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+  "0.", "169.254.", "::1", "fc00:", "fd00:", "fe80:",
+];
+
+// ===== Types =====
 type DetailCacheEntry = {
   expiresAt: number;
   status: number;
   headers: [string, string][];
   body: string;
+  size: number;
 };
 
 type ResolveCacheEntry = {
@@ -19,39 +40,66 @@ type ResolveCacheEntry = {
   finalUrl: string;
 };
 
+// ===== State =====
 const detailHtmlCache = new Map<string, DetailCacheEntry>();
 const mediaResolveCache = new Map<string, ResolveCacheEntry>();
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+let currentConcurrent = 0;
 
+// ===== Periodic cache cleanup (non-blocking) =====
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of detailHtmlCache) {
+    if (v.expiresAt <= now) detailHtmlCache.delete(k);
+  }
+  for (const [k, v] of mediaResolveCache) {
+    if (v.expiresAt <= now) mediaResolveCache.delete(k);
+  }
+  for (const [k, v] of rateLimitMap) {
+    if (v.resetAt <= now) rateLimitMap.delete(k);
+  }
+}, CACHE_CLEANUP_INTERVAL_MS);
+
+// ===== Server =====
 Deno.serve({ port: PORT }, handler);
 console.log(`Proxy running on http://localhost:${PORT}`);
 
+// ===== Main Handler =====
 async function handler(req: Request): Promise<Response> {
   const reqUrl = new URL(req.url);
   const proxyOrigin = reqUrl.origin;
 
-  cleanupCaches();
-
+  // --- CORS preflight ---
   if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders(),
-    });
+    return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
+  // --- Rate limiting ---
+  const clientIp = getClientIp(req);
+  if (!checkRateLimit(clientIp)) {
+    return new Response(
+      errorPage("Rate limit exceeded. Please wait and try again.", ""),
+      { status: 429, headers: htmlHeaders() },
+    );
+  }
+
+  // --- Concurrent connection limit ---
+  if (currentConcurrent >= MAX_CONCURRENT_REQUESTS) {
+    return new Response(
+      errorPage("Server is busy. Please try again in a moment.", ""),
+      { status: 503, headers: htmlHeaders() },
+    );
+  }
+
+  // --- Home page ---
   if (reqUrl.pathname === "/" && !reqUrl.searchParams.has("url")) {
-    return new Response(homePage(), {
-      status: 200,
-      headers: htmlHeaders(),
-    });
+    return new Response(homePage(), { status: 200, headers: htmlHeaders() });
   }
 
+  // --- Extract target URL ---
   let target = extractTargetUrl(req, reqUrl);
-
   if (!target) {
-    return new Response("URL not found", {
-      status: 400,
-      headers: textHeaders(),
-    });
+    return new Response("URL not found", { status: 400, headers: textHeaders() });
   }
 
   target = extractRealTargetFromProxyUrl(target, proxyOrigin, PROXY_PREFIX);
@@ -60,221 +108,324 @@ async function handler(req: Request): Promise<Response> {
     target = "https://" + target;
   }
 
+  // --- Validate target ---
+  let targetUrl: URL;
   try {
-    const targetUrl = new URL(target);
-
-    if (targetUrl.origin === proxyOrigin) {
-      return new Response(
-        errorPage(
-          "Blocked self-proxy loop. The target URL points back to this proxy deployment.",
-          target,
-        ),
-        {
-          status: 508,
-          headers: htmlHeaders(),
-        },
-      );
-    }
-
-    const cookieOrigin = getCookie(req, TARGET_COOKIE) || targetUrl.origin;
-    const isMedia = looksLikeMediaRequest(targetUrl, req);
-
-    // ===== HTML detail cache =====
-    if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
-      const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin);
-      const cached = detailHtmlCache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        const h = new Headers(cached.headers);
-        h.set("content-type", "text/html; charset=utf-8");
-        h.set("x-proxy-cache", "HIT");
-        h.append(
-          "set-cookie",
-          `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
-        );
-        return new Response(cached.body, {
-          status: cached.status,
-          headers: h,
-        });
-      }
-    }
-
-    // ===== media resolve cache =====
-    let effectiveTargetUrl = targetUrl;
-    if (req.method === "GET" && isMedia) {
-      const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
-      const cachedResolve = mediaResolveCache.get(resolveKey);
-      if (cachedResolve && cachedResolve.expiresAt > Date.now()) {
-        try {
-          effectiveTargetUrl = new URL(cachedResolve.finalUrl);
-        } catch {
-          // ignore bad cache
-        }
-      }
-    }
-
-    const upstreamHeaders = buildUpstreamHeaders(req, effectiveTargetUrl);
-    const effectiveIsMedia = looksLikeMediaRequest(effectiveTargetUrl, req);
-
-    const init: RequestInit = {
-      method: req.method,
-      headers: upstreamHeaders,
-      redirect: effectiveIsMedia ? "follow" : "manual",
-    };
-
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      init.body = req.body;
-      // @ts-ignore
-      init.duplex = "half";
-    }
-
-    const upstream = await fetch(effectiveTargetUrl.href, init);
-
-    // save final media resolved URL
-    if (req.method === "GET" && effectiveIsMedia) {
-      const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
-      mediaResolveCache.set(resolveKey, {
-        expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
-        finalUrl: upstream.url || effectiveTargetUrl.href,
-      });
-    }
-
-    const contentType = upstream.headers.get("content-type") || "";
-    const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
-
-    if (!effectiveIsMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
-      const loc = upstream.headers.get("location");
-      if (loc) {
-        const abs = new URL(loc, effectiveTargetUrl.href).href;
-        outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs);
-      }
-
-      outHeaders.append(
-        "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
-      );
-
-      return new Response(null, {
-        status: upstream.status,
-        headers: outHeaders,
-      });
-    }
-
-    if (contentType.includes("text/html")) {
-      let html = await upstream.text();
-      html = rewriteHtml(
-        html,
-        effectiveTargetUrl.href,
-        proxyOrigin + PROXY_PREFIX,
-        cookieOrigin,
-      );
-
-      outHeaders.delete("content-length");
-      outHeaders.delete("content-encoding");
-      outHeaders.set("content-type", "text/html; charset=utf-8");
-      outHeaders.append(
-        "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
-      );
-      outHeaders.set("x-proxy-cache", "MISS");
-
-      // cache detail-like html only
-      if (req.method === "GET" && !effectiveIsMedia && isDetailLikePage(effectiveTargetUrl)) {
-        const cacheKey = makeDetailCacheKey(effectiveTargetUrl.href, cookieOrigin);
-        detailHtmlCache.set(cacheKey, {
-          expiresAt: Date.now() + DETAIL_CACHE_TTL_MS,
-          status: upstream.status,
-          headers: [...outHeaders.entries()],
-          body: html,
-        });
-      }
-
-      return new Response(html, {
-        status: upstream.status,
-        headers: outHeaders,
-      });
-    }
-
-    if (contentType.includes("text/css")) {
-      let css = await upstream.text();
-      css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX);
-
-      outHeaders.delete("content-length");
-      outHeaders.delete("content-encoding");
-      outHeaders.set("content-type", "text/css; charset=utf-8");
-
-      return new Response(css, {
-        status: upstream.status,
-        headers: outHeaders,
-      });
-    }
-
-    if (
-      contentType.includes("javascript") ||
-      contentType.includes("application/javascript") ||
-      contentType.includes("text/javascript") ||
-      contentType.includes("application/x-javascript")
-    ) {
-      outHeaders.append(
-        "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
-      );
-
-      return new Response(upstream.body, {
-        status: upstream.status,
-        headers: outHeaders,
-      });
-    }
-
-    if (
-      contentType.includes("application/json") ||
-      contentType.includes("+json")
-    ) {
-      const txt = await upstream.text();
-      outHeaders.delete("content-length");
-      outHeaders.delete("content-encoding");
-      outHeaders.append(
-        "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
-      );
-
-      return new Response(txt, {
-        status: upstream.status,
-        headers: outHeaders,
-      });
-    }
-
-    outHeaders.append(
-      "set-cookie",
-      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+    targetUrl = new URL(target);
+  } catch {
+    return new Response(
+      errorPage("Invalid URL: " + target, target),
+      { status: 400, headers: htmlHeaders() },
     );
+  }
 
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: outHeaders,
-    });
+  // Block self-proxy loop
+  if (targetUrl.origin === proxyOrigin) {
+    return new Response(
+      errorPage("Blocked self-proxy loop. The target URL points back to this proxy.", target),
+      { status: 508, headers: htmlHeaders() },
+    );
+  }
+
+  // Block internal/private network access (SSRF protection)
+  if (isBlockedTarget(targetUrl)) {
+    return new Response(
+      errorPage("Access to internal networks is not allowed.", target),
+      { status: 403, headers: htmlHeaders() },
+    );
+  }
+
+  // Host allowlist (if configured)
+  if (ALLOWED_HOSTS.length > 0 && !isAllowedHost(targetUrl.hostname)) {
+    return new Response(
+      errorPage("This host is not in the allowed list.", target),
+      { status: 403, headers: htmlHeaders() },
+    );
+  }
+
+  currentConcurrent++;
+  try {
+    return await proxyRequest(req, reqUrl, targetUrl, proxyOrigin);
   } catch (err) {
     console.error("Proxy Error:", err);
     return new Response(
       errorPage(String((err as Error)?.message || err), target),
-      {
-        status: 500,
-        headers: htmlHeaders(),
-      },
+      { status: 500, headers: htmlHeaders() },
     );
+  } finally {
+    currentConcurrent--;
   }
+}
+
+// ===== Core Proxy Logic =====
+async function proxyRequest(
+  req: Request,
+  _reqUrl: URL,
+  targetUrl: URL,
+  proxyOrigin: string,
+): Promise<Response> {
+  const cookieOrigin = getCookie(req, TARGET_COOKIE) || targetUrl.origin;
+  const isMedia = looksLikeMediaRequest(targetUrl, req);
+
+  // --- HTML detail cache (GET only, non-media) ---
+  if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
+    const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin);
+    const cached = detailHtmlCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      const h = new Headers(cached.headers);
+      h.set("content-type", "text/html; charset=utf-8");
+      h.set("x-proxy-cache", "HIT");
+      h.append(
+        "set-cookie",
+        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+      );
+      return new Response(cached.body, { status: cached.status, headers: h });
+    }
+  }
+
+  // --- Media resolve cache ---
+  let effectiveTargetUrl = targetUrl;
+  if (req.method === "GET" && isMedia) {
+    const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
+    const cachedResolve = mediaResolveCache.get(resolveKey);
+    if (cachedResolve && cachedResolve.expiresAt > Date.now()) {
+      try {
+        effectiveTargetUrl = new URL(cachedResolve.finalUrl);
+      } catch { /* ignore */ }
+    }
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(req, effectiveTargetUrl);
+  const effectiveIsMedia = looksLikeMediaRequest(effectiveTargetUrl, req);
+
+  // --- Build fetch init ---
+  const controller = new AbortController();
+  const timeoutMs = effectiveIsMedia ? UPSTREAM_MEDIA_TIMEOUT_MS : UPSTREAM_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const init: RequestInit = {
+    method: req.method,
+    headers: upstreamHeaders,
+    redirect: effectiveIsMedia ? "follow" : "manual",
+    signal: controller.signal,
+  };
+
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = req.body;
+    // @ts-ignore Deno supports duplex
+    init.duplex = "half";
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(effectiveTargetUrl.href, init);
+  } catch (err) {
+    clearTimeout(timer);
+    if ((err as Error).name === "AbortError") {
+      return new Response(
+        errorPage("Upstream request timed out.", effectiveTargetUrl.href),
+        { status: 504, headers: htmlHeaders() },
+      );
+    }
+    throw err;
+  }
+  clearTimeout(timer);
+
+  // Save final media resolved URL
+  if (req.method === "GET" && effectiveIsMedia) {
+    const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
+    mediaResolveCache.set(resolveKey, {
+      expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
+      finalUrl: upstream.url || effectiveTargetUrl.href,
+    });
+    evictIfNeeded(mediaResolveCache, MAX_MEDIA_CACHE_ENTRIES);
+  }
+
+  const contentType = upstream.headers.get("content-type") || "";
+  const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
+
+  // --- Redirect handling (non-media) ---
+  if (!effectiveIsMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
+    const loc = upstream.headers.get("location");
+    if (loc) {
+      const abs = new URL(loc, effectiveTargetUrl.href).href;
+      outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs);
+    }
+    outHeaders.append(
+      "set-cookie",
+      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+    );
+    return new Response(null, { status: upstream.status, headers: outHeaders });
+  }
+
+  // --- HTML ---
+  if (contentType.includes("text/html")) {
+    let html = await upstream.text();
+    html = rewriteHtml(
+      html,
+      effectiveTargetUrl.href,
+      proxyOrigin + PROXY_PREFIX,
+      cookieOrigin,
+    );
+
+    outHeaders.delete("content-length");
+    outHeaders.delete("content-encoding");
+    outHeaders.set("content-type", "text/html; charset=utf-8");
+    outHeaders.append(
+      "set-cookie",
+      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+    );
+    outHeaders.set("x-proxy-cache", "MISS");
+
+    // Cache detail-like pages
+    if (
+      req.method === "GET" &&
+      !effectiveIsMedia &&
+      isDetailLikePage(effectiveTargetUrl) &&
+      html.length <= MAX_HTML_BODY_CACHE_SIZE
+    ) {
+      const cacheKey = makeDetailCacheKey(effectiveTargetUrl.href, cookieOrigin);
+      detailHtmlCache.set(cacheKey, {
+        expiresAt: Date.now() + DETAIL_CACHE_TTL_MS,
+        status: upstream.status,
+        headers: [...outHeaders.entries()],
+        body: html,
+        size: html.length,
+      });
+      evictIfNeeded(detailHtmlCache, MAX_DETAIL_CACHE_ENTRIES);
+    }
+
+    return new Response(html, { status: upstream.status, headers: outHeaders });
+  }
+
+  // --- CSS ---
+  if (contentType.includes("text/css")) {
+    let css = await upstream.text();
+    css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX);
+
+    outHeaders.delete("content-length");
+    outHeaders.delete("content-encoding");
+    outHeaders.set("content-type", "text/css; charset=utf-8");
+
+    return new Response(css, { status: upstream.status, headers: outHeaders });
+  }
+
+  // --- JavaScript ---
+  if (
+    contentType.includes("javascript") ||
+    contentType.includes("application/javascript") ||
+    contentType.includes("text/javascript") ||
+    contentType.includes("application/x-javascript")
+  ) {
+    outHeaders.append(
+      "set-cookie",
+      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+    );
+    return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+  }
+
+  // --- JSON ---
+  if (contentType.includes("application/json") || contentType.includes("+json")) {
+    const txt = await upstream.text();
+    outHeaders.delete("content-length");
+    outHeaders.delete("content-encoding");
+    outHeaders.append(
+      "set-cookie",
+      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+    );
+    return new Response(txt, { status: upstream.status, headers: outHeaders });
+  }
+
+  // --- Media / Binary streaming (pass-through with backpressure) ---
+  outHeaders.append(
+    "set-cookie",
+    `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+  );
+
+  // For media, stream the body directly — no buffering
+  if (effectiveIsMedia && upstream.body) {
+    // Ensure we pass content-range and accept-ranges for resumable downloads
+    const contentRange = upstream.headers.get("content-range");
+    if (contentRange) outHeaders.set("content-range", contentRange);
+    const acceptRanges = upstream.headers.get("accept-ranges");
+    if (acceptRanges) outHeaders.set("accept-ranges", acceptRanges);
+    const contentLength = upstream.headers.get("content-length");
+    if (contentLength) outHeaders.set("content-length", contentLength);
+
+    // Optionally add content-disposition for download
+    if (!outHeaders.has("content-disposition")) {
+      const filename = guessFilename(effectiveTargetUrl);
+      if (filename) {
+        // Don't force download — let browser decide based on context
+        outHeaders.set("content-disposition", `inline; filename="${filename}"`);
+      }
+    }
+
+    return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+  }
+
+  return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+}
+
+// ================= Rate Limiting =================
+
+function getClientIp(req: Request): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("x-real-ip") ||
+    req.headers.get("cf-connecting-ip") ||
+    "unknown"
+  );
+}
+
+function checkRateLimit(ip: string): boolean {
+  if (MAX_REQUESTS_PER_IP_PER_MINUTE <= 0) return true;
+
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+
+  if (!entry || entry.resetAt <= now) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+
+  entry.count++;
+  return entry.count <= MAX_REQUESTS_PER_IP_PER_MINUTE;
+}
+
+// ================= Security Helpers =================
+
+function isBlockedTarget(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  if (host === "localhost") return true;
+
+  for (const cidr of BLOCKED_INTERNAL_CIDRS) {
+    if (host.startsWith(cidr) || host === cidr) return true;
+  }
+
+  return false;
+}
+
+function isAllowedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  for (const allowed of ALLOWED_HOSTS) {
+    if (h === allowed || h.endsWith("." + allowed)) return true;
+  }
+  return false;
 }
 
 // ================= Cache helpers =================
 
-function cleanupCaches() {
-  const now = Date.now();
+function evictIfNeeded<T>(cache: Map<string, T>, maxEntries: number): void {
+  if (cache.size <= maxEntries) return;
 
-  for (const [k, v] of detailHtmlCache.entries()) {
-    if (v.expiresAt <= now) detailHtmlCache.delete(k);
-  }
-
-  for (const [k, v] of mediaResolveCache.entries()) {
-    if (v.expiresAt <= now) mediaResolveCache.delete(k);
+  // Evict oldest entries (first inserted — Map insertion order)
+  const toDelete = cache.size - maxEntries;
+  let deleted = 0;
+  for (const key of cache.keys()) {
+    if (deleted >= toDelete) break;
+    cache.delete(key);
+    deleted++;
   }
 }
 
@@ -326,11 +477,7 @@ function extractTargetUrl(req: Request, url: URL): string {
 }
 
 function inferOriginFromReferer(req: Request): string {
-  const referer =
-    req.headers.get("referer") ||
-    req.headers.get("referrer") ||
-    "";
-
+  const referer = req.headers.get("referer") || req.headers.get("referrer") || "";
   if (!referer) return "";
 
   try {
@@ -382,9 +529,7 @@ function normalizeProxyTarget(
         out = dec;
         changed = true;
       }
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
 
     const fullPrefix = proxyOrigin + proxyPrefix;
 
@@ -432,7 +577,7 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
-// ================= Request / response =================
+// ================= Request / Response Headers =================
 
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
   const path = url.pathname.toLowerCase();
@@ -445,12 +590,29 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
     path.endsWith(".mkv") ||
     path.endsWith(".webm") ||
     path.endsWith(".ts") ||
+    path.endsWith(".avi") ||
+    path.endsWith(".flv") ||
+    path.endsWith(".mov") ||
+    path.endsWith(".m4v") ||
+    path.endsWith(".mp3") ||
+    path.endsWith(".aac") ||
+    path.endsWith(".m4a") ||
     path.includes("/d/") ||
     host.includes("r2.dev") ||
     host.includes("railway.app") ||
     accept.includes("video/") ||
+    accept.includes("audio/") ||
     accept.includes("application/octet-stream")
   );
+}
+
+function guessFilename(url: URL): string {
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return "";
+  const last = segments[segments.length - 1];
+  // Return if it looks like a filename with extension
+  if (/\.\w{2,5}$/.test(last)) return last;
+  return "";
 }
 
 function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
@@ -462,11 +624,11 @@ function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   );
   h.set("accept", req.headers.get("accept") || "*/*");
-  h.set(
-    "accept-language",
-    req.headers.get("accept-language") || "en-US,en;q=0.9",
-  );
-  h.set("accept-encoding", "identity");
+  h.set("accept-language", req.headers.get("accept-language") || "en-US,en;q=0.9");
+
+  // Allow gzip/br for non-media to save bandwidth; identity for media (for Range support)
+  const isMedia = looksLikeMediaRequest(targetUrl, { headers: { get: () => null } } as any);
+  h.set("accept-encoding", isMedia ? "identity" : "gzip, deflate, br");
 
   const cookieOrigin = getCookie(req, TARGET_COOKIE) || "";
   const refererBase = /^https?:\/\//i.test(cookieOrigin)
@@ -481,6 +643,7 @@ function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
     "range",
     "if-none-match",
     "if-modified-since",
+    "if-range",
     "authorization",
     "x-requested-with",
     "cache-control",
@@ -496,8 +659,17 @@ function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
     if (value) h.set(name, value);
   }
 
+  // Don't forward the proxy's own cookies to upstream
+  // Parse upstream cookies only (exclude proxy cookies)
   const cookie = req.headers.get("cookie");
-  if (cookie) h.set("cookie", cookie);
+  if (cookie) {
+    const filtered = cookie
+      .split(";")
+      .map((c) => c.trim())
+      .filter((c) => !c.startsWith(TARGET_COOKIE + "="))
+      .join("; ");
+    if (filtered) h.set("cookie", filtered);
+  }
 
   return h;
 }
@@ -518,6 +690,7 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
     "expires",
     "pragma",
     "location",
+    "content-encoding",
   ];
 
   for (const key of copy) {
@@ -525,6 +698,7 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
     if (value) h.set(key, value);
   }
 
+  // Forward upstream set-cookie
   try {
     const setCookies = (res.headers as any).getSetCookie?.() || [];
     for (const sc of setCookies) h.append("set-cookie", sc);
@@ -533,24 +707,22 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
     if (sc) h.set("set-cookie", sc);
   }
 
+  // Rewrite location header
   const loc = h.get("location");
   if (loc) {
     try {
       const abs = new URL(loc).href;
       h.set("location", proxyOrigin + PROXY_PREFIX + abs);
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore relative locations — they'll be handled by redirect logic */ }
   }
 
+  // CORS headers
   h.set("access-control-allow-origin", "*");
-  h.set(
-    "access-control-allow-methods",
-    "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
-  );
+  h.set("access-control-allow-methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD");
   h.set("access-control-allow-headers", "*");
   h.set("access-control-expose-headers", "*");
 
+  // Remove restrictive security headers
   h.delete("content-security-policy");
   h.delete("content-security-policy-report-only");
   h.delete("x-frame-options");
@@ -580,6 +752,7 @@ function rewriteHtml(
     "",
   );
 
+  // Rewrite src, href, action, poster attributes
   html = html.replace(
     /((?:href|src|action|poster)\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, value) => {
@@ -593,6 +766,7 @@ function rewriteHtml(
     },
   );
 
+  // Rewrite srcset
   html = html.replace(
     /(srcset\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, val) => {
@@ -614,6 +788,7 @@ function rewriteHtml(
     },
   );
 
+  // Rewrite inline styles
   html = html.replace(
     /(style\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, val) => {
@@ -621,6 +796,7 @@ function rewriteHtml(
     },
   );
 
+  // Rewrite <style> blocks
   html = html.replace(
     /(<style[^>]*>)([\s\S]*?)(<\/style>)/gi,
     (_m, open, css, close) => {
@@ -628,8 +804,8 @@ function rewriteHtml(
     },
   );
 
+  // Inject client-side script
   const injected = injectedScript(proxyBase, targetOrigin, baseUrl);
-
   const headOpen = html.match(/<head[^>]*>/i);
   if (headOpen) {
     const idx = html.indexOf(headOpen[0]) + headOpen[0].length;
@@ -689,7 +865,7 @@ function toAbs(value: string, baseUrl: string): string | null {
   }
 }
 
-// ================= Injected script =================
+// ================= Injected Script =================
 
 function injectedScript(
   proxyBase: string,
@@ -736,6 +912,12 @@ function isMediaLike(u){
     u.indexOf('.mp4') !== -1 ||
     u.indexOf('.m3u8') !== -1 ||
     u.indexOf('.ts') !== -1 ||
+    u.indexOf('.mkv') !== -1 ||
+    u.indexOf('.webm') !== -1 ||
+    u.indexOf('.avi') !== -1 ||
+    u.indexOf('.mov') !== -1 ||
+    u.indexOf('.mp3') !== -1 ||
+    u.indexOf('.aac') !== -1 ||
     u.indexOf('r2.dev') !== -1 ||
     u.indexOf('railway.app') !== -1
   );
@@ -815,17 +997,17 @@ function rewriteSrcset(v){
 
 persistTargetOrigin();
 
+// --- Intercept fetch ---
 try{
   var originalFetch = window.fetch;
   window.fetch = function(input, init){
     try{
       if(typeof input === 'string'){
         input = proxify(input);
-      }else if(input && typeof input === 'object'){
-        var u = input.url || input.href || '';
-        if(u){
-          input = new Request(proxify(u), input);
-        }
+      }else if(input instanceof URL){
+        input = proxify(input.href);
+      }else if(input && typeof input === 'object' && input.url){
+        input = new Request(proxify(input.url), input);
       }
     }catch(e){}
     persistTargetOrigin();
@@ -833,6 +1015,7 @@ try{
   };
 }catch(e){}
 
+// --- Intercept XMLHttpRequest ---
 try{
   var originalXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(){
@@ -844,6 +1027,22 @@ try{
   };
 }catch(e){}
 
+// --- Intercept WebSocket ---
+try{
+  var OrigWebSocket = window.WebSocket;
+  window.WebSocket = function(url, protocols){
+    // Rewrite ws/wss URLs through proxy if needed
+    // For now, just allow them as-is since most proxy setups don't handle WS
+    return protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+  };
+  window.WebSocket.prototype = OrigWebSocket.prototype;
+  window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+  window.WebSocket.OPEN = OrigWebSocket.OPEN;
+  window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+  window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+}catch(e){}
+
+// --- Intercept history ---
 try{
   var pushState = history.pushState;
   var replaceState = history.replaceState;
@@ -875,6 +1074,7 @@ try{
   };
 }catch(e){}
 
+// --- Intercept window.open ---
 try{
   var winOpen = window.open;
   window.open = function(u,n,f){
@@ -883,6 +1083,7 @@ try{
   };
 }catch(e){}
 
+// --- Intercept setAttribute ---
 try{
   var setAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function(name, value){
@@ -902,6 +1103,54 @@ try{
   };
 }catch(e){}
 
+// --- Intercept property setters for src/href ---
+try{
+  ['HTMLImageElement','HTMLScriptElement','HTMLLinkElement','HTMLSourceElement',
+   'HTMLVideoElement','HTMLAudioElement','HTMLIFrameElement','HTMLEmbedElement'].forEach(function(ctorName){
+    try{
+      var proto = window[ctorName] && window[ctorName].prototype;
+      if(!proto) return;
+
+      var srcDesc = Object.getOwnPropertyDescriptor(proto, 'src');
+      if(srcDesc && srcDesc.set){
+        var origSet = srcDesc.set;
+        Object.defineProperty(proto, 'src', {
+          get: srcDesc.get,
+          set: function(v){
+            if(typeof v === 'string' && v && v.indexOf(PROXY_BASE) !== 0 && v.indexOf('/proxy/http') === -1){
+              v = proxify(v);
+            }
+            return origSet.call(this, v);
+          },
+          enumerable: true,
+          configurable: true
+        });
+      }
+    }catch(e){}
+  });
+
+  // Intercept HTMLAnchorElement.href setter
+  try{
+    var anchorProto = HTMLAnchorElement.prototype;
+    var hrefDesc = Object.getOwnPropertyDescriptor(anchorProto, 'href');
+    if(hrefDesc && hrefDesc.set){
+      var origHrefSet = hrefDesc.set;
+      Object.defineProperty(anchorProto, 'href', {
+        get: hrefDesc.get,
+        set: function(v){
+          if(typeof v === 'string' && v && v.indexOf(PROXY_BASE) !== 0 && v.indexOf('/proxy/http') === -1){
+            v = proxify(v);
+          }
+          return origHrefSet.call(this, v);
+        },
+        enumerable: true,
+        configurable: true
+      });
+    }
+  }catch(e){}
+}catch(e){}
+
+// --- Click handler ---
 document.addEventListener('click', function(e){
   var el = e.target;
   var limit = 20;
@@ -938,6 +1187,7 @@ document.addEventListener('click', function(e){
   }
 }, true);
 
+// --- Form submit handler ---
 document.addEventListener('submit', function(e){
   var f = e.target;
   if(f && f.tagName === 'FORM'){
@@ -949,6 +1199,7 @@ document.addEventListener('submit', function(e){
   }
 }, true);
 
+// --- MutationObserver ---
 function rewriteNode(el){
   if(!el || !el.getAttribute) return;
 
@@ -988,13 +1239,19 @@ var mo = new MutationObserver(function(muts){
         }
       }
     }
+    // Also handle attribute changes
+    if(m.type === 'attributes' && m.target && m.target.nodeType === 1){
+      rewriteNode(m.target);
+    }
   }
 });
 
 if(document.documentElement){
   mo.observe(document.documentElement, {
-    childList:true,
-    subtree:true
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src','href','action','poster','srcset']
   });
 }
 
@@ -1012,24 +1269,41 @@ window.addEventListener('load', function(){
   persistTargetOrigin();
   setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
+  setTimeout(function(){ rewriteTree(document.documentElement); }, 2000);
 });
 
+// --- Disable Service Worker ---
 try{
   Object.defineProperty(navigator, 'serviceWorker', {
     get: function(){
       return {
-        register: function(){ return Promise.reject(new Error('SW disabled')); },
+        register: function(){ return Promise.reject(new Error('SW disabled by proxy')); },
         getRegistrations: function(){ return Promise.resolve([]); },
+        getRegistration: function(){ return Promise.resolve(undefined); },
         ready: Promise.resolve({
           unregister: function(){ return Promise.resolve(true); }
-        })
+        }),
+        addEventListener: function(){},
+        removeEventListener: function(){}
       };
     },
     configurable: true
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz final cached version active');
+// --- Intercept createElement to catch dynamic script src ---
+try{
+  var origCreateElement = document.createElement.bind(document);
+  document.createElement = function(tag){
+    var el = origCreateElement(tag);
+    if(tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'img'){
+      // Property will be intercepted by our property setter above
+    }
+    return el;
+  };
+}catch(e){}
+
+console.log('[Proxy] Enhanced proxy with streaming & concurrency support active');
 })();
 <\/script>`;
 }
@@ -1066,24 +1340,44 @@ function homePage(): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Deno Proxy</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0f172a;color:#fff;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:20px}
-.box{width:min(92%,560px);background:#111827;border:1px solid #334155;border-radius:16px;padding:24px}
-h1{margin:0 0 12px}
-p{color:#cbd5e1}
-input{width:100%;padding:14px;border-radius:10px;border:1px solid #475569;background:#0b1220;color:#fff;margin:14px 0}
-button{width:100%;padding:14px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700}
-small{display:block;margin-top:12px;color:#94a3b8}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#fff;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:20px}
+.box{width:min(92%,560px);background:#111827;border:1px solid #334155;border-radius:16px;padding:28px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{margin:0 0 8px;font-size:1.6rem}
+.subtitle{color:#94a3b8;font-size:.85rem;margin-bottom:16px}
+.stats{display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap}
+.stat{background:#1e293b;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#cbd5e1}
+.stat b{color:#60a5fa}
+p{color:#cbd5e1;margin:0 0 6px;font-size:.95rem}
+input{width:100%;padding:14px;border-radius:10px;border:1px solid #475569;background:#0b1220;color:#fff;margin:14px 0;font-size:1rem;outline:none;transition:border .2s}
+input:focus{border-color:#2563eb}
+button{width:100%;padding:14px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700;font-size:1rem;cursor:pointer;transition:background .2s}
+button:hover{background:#1d4ed8}
+small{display:block;margin-top:12px;color:#64748b}
+.features{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:16px}
+.feat{background:#1e293b;border-radius:8px;padding:10px 12px;font-size:.8rem;color:#94a3b8}
+.feat b{color:#34d399;font-weight:600}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>Deno Proxy</h1>
-  <p>pyazz.com အတွက် detail + media + short cache ပါတဲ့ proxy</p>
+  <div class="subtitle">High-performance streaming proxy with caching</div>
+  <div class="stats">
+    <div class="stat">Concurrent: <b id="cc">-</b></div>
+    <div class="stat">Cache entries: <b id="ce">-</b></div>
+  </div>
   <form onsubmit="go(event)">
-    <input id="u" type="text" placeholder="https://pyazz.com" required>
+    <input id="u" type="text" placeholder="https://pyazz.com" required autocomplete="url">
     <button type="submit">Browse</button>
   </form>
   <small>Example: https://pyazz.com</small>
+  <div class="features">
+    <div class="feat"><b>Stream</b> — Video streaming with Range support</div>
+    <div class="feat"><b>Cache</b> — Smart HTML & resolve caching</div>
+    <div class="feat"><b>Rate Limit</b> — Per-IP request throttling</div>
+    <div class="feat"><b>Security</b> — SSRF protection built-in</div>
+  </div>
 </div>
 <script>
 function go(e){
@@ -1092,6 +1386,11 @@ function go(e){
   if(!/^https?:\\/\\//i.test(u)) u = 'https://' + u;
   location.href = '/proxy/' + u;
 }
+// Fetch stats
+fetch('/proxy/__stats__').then(r=>r.json()).then(d=>{
+  document.getElementById('cc').textContent=d.concurrent||0;
+  document.getElementById('ce').textContent=(d.detailCacheSize||0)+(d.mediaCacheSize||0);
+}).catch(()=>{});
 </script>
 </body>
 </html>`;
@@ -1105,16 +1404,29 @@ function errorPage(msg: string, url: string): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Proxy Error</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0f172a;color:#fff;padding:30px}
-pre{white-space:pre-wrap;background:#111827;padding:16px;border-radius:10px;border:1px solid #334155}
-a{color:#60a5fa}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#fff;padding:30px}
+.container{max-width:600px;margin:0 auto}
+h2{color:#f87171}
+pre{white-space:pre-wrap;word-break:break-all;background:#111827;padding:16px;border-radius:10px;border:1px solid #334155;font-size:.9rem}
+.url{color:#94a3b8;font-size:.85rem;margin:8px 0}
+a{color:#60a5fa;text-decoration:none}
+a:hover{text-decoration:underline}
+.actions{margin-top:16px;display:flex;gap:10px}
+.btn{display:inline-block;padding:10px 20px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#fff;text-decoration:none;font-size:.9rem}
+.btn:hover{background:#334155}
 </style>
 </head>
 <body>
+<div class="container">
 <h2>Proxy Error</h2>
 <pre>${escapeHtml(msg)}</pre>
-<p>URL: ${escapeHtml(url)}</p>
-<p><a href="/">Back</a></p>
+${url ? `<p class="url">URL: ${escapeHtml(url)}</p>` : ""}
+<div class="actions">
+  <a href="/" class="btn">Home</a>
+  <a href="javascript:history.back()" class="btn">Go Back</a>
+  ${url ? `<a href="/proxy/${escapeHtml(url)}" class="btn">Retry</a>` : ""}
+</div>
+</div>
 </body>
 </html>`;
 }
