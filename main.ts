@@ -210,19 +210,29 @@ async function handler(req: Request): Promise<Response> {
       contentType.includes("text/javascript") ||
       contentType.includes("application/x-javascript")
     ) {
+      // Rewrite JS content to fix Next.js data fetching URLs
+      let jsText = await upstream.text();
+      jsText = rewriteJavaScript(jsText, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX, cookieOrigin || targetUrl.origin);
+
+      outHeaders.delete("content-length");
+      outHeaders.delete("content-encoding");
       outHeaders.append(
         "set-cookie",
         `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin || targetUrl.origin)}; Path=/; SameSite=Lax`,
       );
 
-      return new Response(upstream.body, {
+      return new Response(jsText, {
         status: upstream.status,
         headers: outHeaders,
       });
     }
 
     if (contentType.includes("application/json") || contentType.includes("+json")) {
-      const txt = await upstream.text();
+      let txt = await upstream.text();
+
+      // Rewrite JSON responses that contain URLs (e.g., _next/data responses, API responses)
+      txt = rewriteJsonUrls(txt, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX, cookieOrigin || targetUrl.origin);
+
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
       outHeaders.append(
@@ -381,7 +391,6 @@ function isTopLevelDocumentRequest(req: Request): boolean {
   return dest === "document" || mode === "navigate";
 }
 
-// FIX 1: Identify Meilisearch API requests so they are NOT treated as media
 function isMeilisearchApiRequest(url: URL): boolean {
   const h = url.hostname.toLowerCase();
   return h.includes("getmeilimeilisearchv190-production") && h.endsWith(".railway.app");
@@ -436,7 +445,8 @@ function isDetailLikePage(url: URL): boolean {
     /^\/video\/[a-z0-9-]+(?:\/)?$/i.test(url.pathname) ||
     p === "/" ||
     p.startsWith("/movies") ||
-    p.startsWith("/search")
+    p.startsWith("/search") ||
+    p.startsWith("/latest")
   );
 }
 
@@ -574,17 +584,17 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
-// FIX 1: Exclude Meilisearch API from being treated as media
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
-  // Meilisearch API on railway.app is NOT media
   if (isMeilisearchApiRequest(url)) return false;
 
   const path = url.pathname.toLowerCase();
   const host = url.hostname.toLowerCase();
   const accept = (req.headers.get("accept") || "").toLowerCase();
 
-  // pyazzindex API on railway.app is NOT media either
   if (host.includes("pyazzindex-production") && host.endsWith(".railway.app")) return false;
+
+  // Next.js data routes are NOT media
+  if (path.startsWith("/_next/")) return false;
 
   return (
     path.endsWith(".mp4") ||
@@ -594,7 +604,8 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
     path.endsWith(".ts") ||
     path.includes("/d/") ||
     host.includes("r2.dev") ||
-    host.includes("railway.app") ||
+    host.includes("r2.cloudflarestorage.com") ||
+    (host.includes("railway.app") && !host.includes("pyazzindex-production") && !host.includes("getmeilimeilisearchv190-production")) ||
     accept.includes("video/") ||
     accept.includes("application/octet-stream")
   );
@@ -722,6 +733,34 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   return h;
 }
 
+// NEW: Rewrite JavaScript to fix hardcoded origin URLs
+function rewriteJavaScript(
+  js: string,
+  baseUrl: string,
+  proxyBase: string,
+  targetOrigin: string,
+): string {
+  // Replace hardcoded pyazz.com origins in JS bundles
+  for (const origin of PYAZZ_ORIGINS) {
+    // Replace "https://pyazz.com" and 'https://pyazz.com' in JS
+    js = js.replaceAll(`"${origin}"`, `"${proxyBase}${origin}"`);
+    js = js.replaceAll(`'${origin}'`, `'${proxyBase}${origin}'`);
+  }
+  return js;
+}
+
+// NEW: Rewrite JSON responses that may contain URLs
+function rewriteJsonUrls(
+  json: string,
+  _baseUrl: string,
+  _proxyBase: string,
+  _targetOrigin: string,
+): string {
+  // Don't aggressively rewrite JSON - just return as-is
+  // The client-side fetch interceptor handles URL rewriting
+  return json;
+}
+
 function rewriteHtml(
   html: string,
   baseUrl: string,
@@ -782,6 +821,15 @@ function rewriteHtml(
     /(<style[^>]*>)([\s\S]*?)(<\/style>)/gi,
     (_m, open, css, close) => {
       return open + rewriteCss(css, baseUrl, proxyBase) + close;
+    },
+  );
+
+  // Rewrite __NEXT_DATA__ script if present
+  html = html.replace(
+    /(<script\s+id\s*=\s*["']__NEXT_DATA__["'][^>]*>)([\s\S]*?)(<\/script>)/gi,
+    (_m, open, content, close) => {
+      // Don't rewrite Next data - let client handle it
+      return open + content + close;
     },
   );
 
@@ -867,7 +915,7 @@ function isUnsupportedLocalPath(path){
     var s = String(path || '').trim().toLowerCase();
     for(var i=0;i<UNSUPPORTED_PATHS.length;i++){
       var p = UNSUPPORTED_PATHS[i];
-      if(s === p || s.indexOf(p + '?') === 0 || s.indexOf(p + '#') === 0) return true;
+      if(s === p || s.indexOf(p + '?') === 0 || s.indexOf(p + '#') === 0 || s.indexOf(p + '/') === 0) return true;
     }
   }catch(e){}
   return false;
@@ -876,17 +924,13 @@ function isUnsupportedLocalPath(path){
 function shouldIgnoreDebugUrl(url){
   try{
     var s = String(url || '');
-
     if(/google-analytics\\.com|googletagmanager\\.com/i.test(s)) return true;
-
     var p1 = location.origin + '/proxy/https://' + location.host + '/';
     var p2 = location.origin + '/proxy/http://' + location.host + '/';
     var p3 = location.origin + '/proxy/' + location.origin + '/';
-
     if(s.indexOf(p1) === 0) return true;
     if(s.indexOf(p2) === 0) return true;
     if(s.indexOf(p3) === 0) return true;
-
     return false;
   }catch(e){
     return false;
@@ -916,25 +960,47 @@ function currentTargetPage(){
   return CURRENT_PAGE;
 }
 
+// Detect Next.js internal routes like /_next/data/xxx/...
+function isNextDataRoute(u){
+  if(!u || typeof u !== 'string') return false;
+  return /^\\/_next\\//i.test(u.trim()) || /\\/_next\\/data\\//i.test(u);
+}
+
 function isAppRoute(u){
   if(!u || typeof u !== 'string') return false;
   return /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(u.trim());
 }
 
+// Check if this is a pyazz.com page path (not just /video/ but also /latest, /movies, /search, etc.)
+function isPyazzPagePath(path){
+  if(!path || typeof path !== 'string') return false;
+  var p = path.trim().toLowerCase();
+  if(p === '/' || p === '') return true;
+  if(/^\\/video\\//i.test(p)) return true;
+  if(/^\\/latest/i.test(p)) return true;
+  if(/^\\/movies/i.test(p)) return true;
+  if(/^\\/search/i.test(p)) return true;
+  if(/^\\/request/i.test(p)) return true;
+  if(/^\\/genre\\//i.test(p)) return true;
+  if(/^\\/country\\//i.test(p)) return true;
+  if(/^\\/year\\//i.test(p)) return true;
+  // Pagination patterns like /movies?page=2 or /latest?page=2
+  return false;
+}
+
 function isMediaLike(u){
   if(!u || typeof u !== 'string') return false;
   u = u.toLowerCase();
-  // Do NOT treat meilisearch or pyazzindex railway URLs as media
   if(u.indexOf('getmeilimeilisearchv190-production') !== -1) return false;
   if(u.indexOf('pyazzindex-production') !== -1) return false;
+  if(u.indexOf('/_next/') !== -1) return false;
   return (
     u.indexOf('/d/') !== -1 ||
     u.indexOf('.mp4') !== -1 ||
     u.indexOf('.m3u8') !== -1 ||
     u.indexOf('.ts') !== -1 ||
     u.indexOf('r2.dev') !== -1 ||
-    u.indexOf('r2.cloudflarestorage.com') !== -1 ||
-    u.indexOf('railway.app') !== -1
+    u.indexOf('r2.cloudflarestorage.com') !== -1
   );
 }
 
@@ -955,8 +1021,8 @@ function unwrapSelfProxyUrl(u){
 
         if(isUnsupportedLocalPath(tail)) return '#';
 
-        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(tail)){
-          return tail;
+        if(isPyazzPagePath(tail) || isAppRoute(tail)){
+          return PROXY_BASE + TARGET_ORIGIN + tail;
         }
 
         return PROXY_BASE + TARGET_ORIGIN + tail;
@@ -966,27 +1032,26 @@ function unwrapSelfProxyUrl(u){
   return null;
 }
 
-function toLocalProxyRoute(u){
+function toProxyUrl(u){
   try{
     if(typeof u !== 'string') return u;
 
-    if(isAppRoute(u)) return u;
+    // Handle Next.js internal routes - always proxy through target origin
+    if(isNextDataRoute(u)){
+      return PROXY_BASE + TARGET_ORIGIN + u;
+    }
 
     var parsed = new URL(u, currentTargetPage());
     var route = parsed.pathname + parsed.search + parsed.hash;
 
-    if(
-      parsed.origin === TARGET_ORIGIN &&
-      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
-    ){
-      return route;
+    // If it's a pyazz.com page route, use full proxy URL (not local route)
+    // This ensures proper server-side rendering for each page
+    if(parsed.origin === TARGET_ORIGIN && isPyazzPagePath(parsed.pathname)){
+      return PROXY_BASE + parsed.href;
     }
 
-    if(
-      parsed.origin === location.origin &&
-      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
-    ){
-      return route;
+    if(parsed.origin === TARGET_ORIGIN){
+      return PROXY_BASE + parsed.href;
     }
   }catch(e){}
 
@@ -1004,11 +1069,13 @@ function proxify(u){
   var selfFixed = unwrapSelfProxyUrl(u);
   if(selfFixed !== null) return selfFixed;
 
-  var localRoute = toLocalProxyRoute(u);
-  if(localRoute) return localRoute;
-
   if(u.indexOf(PROXY_BASE) === 0) return u;
   if(u.indexOf('/proxy/http') !== -1) return u;
+
+  // Handle Next.js internal routes
+  if(isNextDataRoute(u)){
+    return PROXY_BASE + TARGET_ORIGIN + u;
+  }
 
   try{
     var parsedDirect = new URL(u);
@@ -1016,11 +1083,6 @@ function proxify(u){
 
     if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') !== 0){
       if(isUnsupportedLocalPath(directRoute)) return '#';
-
-      if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(directRoute)){
-        return directRoute;
-      }
-
       return PROXY_BASE + TARGET_ORIGIN + directRoute;
     }
 
@@ -1042,17 +1104,7 @@ function proxify(u){
 
       if(isUnsupportedLocalPath(route2)) return '#';
 
-      if(
-        parsedAbs.origin === TARGET_ORIGIN &&
-        /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
-      ){
-        return route2;
-      }
-
       if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') !== 0){
-        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)){
-          return route2;
-        }
         return PROXY_BASE + TARGET_ORIGIN + route2;
       }
 
@@ -1119,22 +1171,18 @@ function hideUnsupportedTabs(root){
   }catch(e){}
 }
 
-// FIX 2: Show movie titles below poster images
 function showMovieTitles(root){
   try{
-    var cards = (root && root.querySelectorAll ? root : document).querySelectorAll('a[href*="/video/"]');
+    var cards = (root && root.querySelectorAll ? root : document).querySelectorAll('a[href*="/video/"], a[href*="/proxy/"]');
     for(var i = 0; i < cards.length; i++){
       var card = cards[i];
       if(card.getAttribute('data-proxy-title-added') === '1') continue;
 
-      // Find the image inside the card
       var img = card.querySelector('img');
       if(!img) continue;
 
-      // Try to get the title from alt text or title attribute
       var title = img.getAttribute('alt') || img.getAttribute('title') || '';
 
-      // If no title from image, try to extract from the URL
       if(!title){
         try{
           var href = card.getAttribute('href') || '';
@@ -1147,14 +1195,12 @@ function showMovieTitles(root){
 
       if(!title) continue;
 
-      // Check if there's already a visible title element
       var existingTitle = card.querySelector('.movie-title, .title, [class*="title"], [class*="name"]');
       if(existingTitle && existingTitle.textContent.trim()) {
         card.setAttribute('data-proxy-title-added', '1');
         continue;
       }
 
-      // Create a title element
       var titleEl = document.createElement('div');
       titleEl.className = 'proxy-movie-title';
       titleEl.textContent = title;
@@ -1171,7 +1217,6 @@ function showMovieTitles(root){
   }catch(e){}
 }
 
-// FIX 3: Completely rewritten video patching - no more aggressive auto-retry/refresh
 function patchVideoElements(root){
   try{
     var vids = [];
@@ -1190,28 +1235,37 @@ function patchVideoElements(root){
       if(!v || v.__proxyPatched) continue;
       v.__proxyPatched = true;
 
-      // Only handle genuine fatal errors, not transient ones
-      // Do NOT auto-retry or auto-reload - this causes the restart loop
       (function(video){
         var errorCount = 0;
 
         video.addEventListener('error', function(e){
           errorCount++;
-          // Only log, do NOT auto-reload/retry
-          // The browser handles buffering and recovery on its own
           try{
             var src = video.currentSrc || video.getAttribute('src') || '';
             console.log('[Proxy] Video error #' + errorCount + ' for: ' + src);
           }catch(ex){}
         });
 
-        // Prevent any external code from calling load() repeatedly
+        // Ensure video src is proxied
+        var currentSrc = video.getAttribute('src');
+        if(currentSrc && currentSrc.indexOf('/proxy/') === -1 && /^https?:\\/\\//i.test(currentSrc)){
+          video.setAttribute('src', proxify(currentSrc));
+        }
+
+        // Also check source elements
+        var sources = video.querySelectorAll('source');
+        for(var s = 0; s < sources.length; s++){
+          var srcAttr = sources[s].getAttribute('src');
+          if(srcAttr && srcAttr.indexOf('/proxy/') === -1 && /^https?:\\/\\//i.test(srcAttr)){
+            sources[s].setAttribute('src', proxify(srcAttr));
+          }
+        }
+
         var origLoad = video.load.bind(video);
-        var loadCount = 0;
         var lastLoadTime = 0;
+        var loadCount = 0;
         video.load = function(){
           var now = Date.now();
-          // Throttle: allow load() at most once every 3 seconds
           if(now - lastLoadTime < 3000){
             loadCount++;
             if(loadCount > 2){
@@ -1230,6 +1284,10 @@ function patchVideoElements(root){
 }
 
 persistTargetOrigin();
+
+// ===== CRITICAL FIX: Intercept Next.js client-side navigation =====
+// Next.js SPA uses client-side routing that fetches JSON data from /_next/data/...
+// We need to ensure these requests go through the proxy AND that page transitions work
 
 try{
   var originalFetch = window.fetch;
@@ -1272,18 +1330,57 @@ try{
   };
 }catch(e){}
 
+// ===== CRITICAL FIX: Force full page navigation for SPA route changes =====
+// Instead of letting Next.js do client-side routing (which breaks in proxy),
+// we intercept pushState/replaceState to force full page loads for page transitions
+
 try{
   var pushState = history.pushState;
   var replaceState = history.replaceState;
+  var lastPushUrl = '';
 
   history.pushState = function(s,t,u){
     if(u && typeof u === 'string'){
-      var localRoute = toLocalProxyRoute(u);
-      if(localRoute){
-        u = localRoute;
-      }else if(u.indexOf(PROXY_BASE) !== 0 && u.indexOf('/proxy/http') === -1){
-        u = proxify(u);
-      }
+      var newUrl = u;
+
+      // If this is a pyazz page path change (not just hash change), force full navigation
+      try{
+        var currentPath = location.pathname;
+        var newPath = newUrl;
+
+        // Extract path from proxy URL if needed
+        var proxyIdx = newPath.indexOf('/proxy/');
+        if(proxyIdx !== -1){
+          try{
+            var afterProxy = newPath.substring(proxyIdx + 7);
+            var parsed = new URL(afterProxy);
+            newPath = parsed.pathname;
+          }catch(e){}
+        }
+
+        // If the path is actually changing (not just query params on same page)
+        // and it's a pyazz page, force full navigation
+        if(isPyazzPagePath(newPath) && currentPath !== newPath){
+          var fullUrl = proxify(u);
+          if(fullUrl && fullUrl !== '#' && fullUrl !== u){
+            // Let pushState happen normally but then navigate
+            lastPushUrl = fullUrl;
+            persistTargetOrigin();
+            // Use setTimeout to let the current JS finish, then navigate
+            setTimeout(function(){
+              if(lastPushUrl){
+                var navUrl = lastPushUrl;
+                lastPushUrl = '';
+                location.href = navUrl;
+              }
+            }, 50);
+            return pushState.call(this, s, t, u);
+          }
+        }
+      }catch(e){}
+
+      // For non-page-change pushState, just proxify the URL
+      u = proxify(u);
     }
     persistTargetOrigin();
     return pushState.call(this, s, t, u);
@@ -1291,17 +1388,29 @@ try{
 
   history.replaceState = function(s,t,u){
     if(u && typeof u === 'string'){
-      var localRoute = toLocalProxyRoute(u);
-      if(localRoute){
-        u = localRoute;
-      }else if(u.indexOf(PROXY_BASE) !== 0 && u.indexOf('/proxy/http') === -1){
-        u = proxify(u);
-      }
+      u = proxify(u);
     }
     persistTargetOrigin();
     return replaceState.call(this, s, t, u);
   };
 }catch(e){}
+
+// ===== Handle popstate (browser back/forward) =====
+window.addEventListener('popstate', function(e){
+  // On back/forward, force a full reload to get proper server-rendered content
+  try{
+    var path = location.pathname;
+    if(path.indexOf('/proxy/') === 0){
+      // Already a proxy URL, just reload
+      location.reload();
+    } else if(isPyazzPagePath(path)){
+      // Navigate to the proxy version
+      location.href = PROXY_BASE + TARGET_ORIGIN + path + location.search + location.hash;
+    }
+  }catch(ex){
+    location.reload();
+  }
+});
 
 try{
   var winOpen = window.open;
@@ -1330,6 +1439,7 @@ try{
   };
 }catch(e){}
 
+// ===== Click handler - force full page navigation =====
 document.addEventListener('click', function(e){
   var el = e.target;
   var limit = 20;
@@ -1355,18 +1465,11 @@ document.addEventListener('click', function(e){
       e.stopPropagation();
       persistTargetOrigin();
 
-      var localRoute = toLocalProxyRoute(href);
-      if(localRoute){
-        location.href = localRoute;
-        return false;
+      // Always force full page navigation through proxy
+      var finalUrl = proxify(href);
+      if(finalUrl && finalUrl !== '#'){
+        location.href = finalUrl;
       }
-
-      if(href.indexOf(PROXY_BASE) === 0 || href.indexOf('/proxy/http') !== -1){
-        location.href = href;
-        return false;
-      }
-
-      location.href = proxify(href);
       return false;
     }
   }
@@ -1482,7 +1585,7 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz-only locked version active');
+console.log('[Proxy] pyazz-only locked version active (v2 - SPA nav fix)');
 })();
 <\/script>`;
 }
