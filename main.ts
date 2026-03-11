@@ -823,7 +823,19 @@ function injectedScript(
 
 function shouldIgnoreDebugUrl(url){
   try{
-    return /google-analytics\\.com|googletagmanager\\.com/i.test(url || '');
+    var s = String(url || '');
+
+    if(/google-analytics\\.com|googletagmanager\\.com/i.test(s)) return true;
+
+    var selfProxyPrefix1 = location.origin + '/proxy/' + location.origin + '/video/';
+    var selfProxyPrefix2 = location.origin + '/proxy/https://' + location.host + '/video/';
+    var selfProxyPrefix3 = location.origin + '/proxy/http://' + location.host + '/video/';
+
+    if(s.indexOf(selfProxyPrefix1) === 0) return true;
+    if(s.indexOf(selfProxyPrefix2) === 0) return true;
+    if(s.indexOf(selfProxyPrefix3) === 0) return true;
+
+    return false;
   }catch(e){
     return false;
   }
@@ -959,13 +971,27 @@ function isMediaLike(u){
 function toLocalProxyRoute(u){
   try{
     if(typeof u !== 'string') return u;
+
     if(isAppRoute(u)) return u;
 
     var parsed = new URL(u, currentTargetPage());
-    if(parsed.origin === TARGET_ORIGIN && /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(parsed.pathname + parsed.search + parsed.hash)){
-      return parsed.pathname + parsed.search + parsed.hash;
+    var route = parsed.pathname + parsed.search + parsed.hash;
+
+    if(
+      parsed.origin === TARGET_ORIGIN &&
+      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
+    ){
+      return route;
+    }
+
+    if(
+      parsed.origin === location.origin &&
+      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
+    ){
+      return route;
     }
   }catch(e){}
+
   return null;
 }
 
@@ -983,6 +1009,15 @@ function proxify(u){
 
   try{
     var parsedDirect = new URL(u);
+    var route = parsedDirect.pathname + parsedDirect.search + parsedDirect.hash;
+
+    if(
+      parsedDirect.origin === location.origin &&
+      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
+    ){
+      return route;
+    }
+
     if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') === 0){
       return u;
     }
@@ -997,9 +1032,20 @@ function proxify(u){
 
     try{
       var parsedAbs = new URL(abs);
+      var route2 = parsedAbs.pathname + parsedAbs.search + parsedAbs.hash;
 
-      if(parsedAbs.origin === TARGET_ORIGIN && /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(parsedAbs.pathname + parsedAbs.search + parsedAbs.hash)){
-        return parsedAbs.pathname + parsedAbs.search + parsedAbs.hash;
+      if(
+        parsedAbs.origin === TARGET_ORIGIN &&
+        /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
+      ){
+        return route2;
+      }
+
+      if(
+        parsedAbs.origin === location.origin &&
+        /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
+      ){
+        return route2;
       }
 
       if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') === 0){
