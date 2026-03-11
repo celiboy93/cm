@@ -360,13 +360,8 @@ function isTempMediaHost(hostname: string): boolean {
 function isTopLevelDocumentRequest(req: Request): boolean {
   const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
   const mode = (req.headers.get("sec-fetch-mode") || "").toLowerCase();
-  const accept = (req.headers.get("accept") || "").toLowerCase();
 
-  return (
-    dest === "document" ||
-    mode === "navigate" ||
-    accept.includes("text/html")
-  );
+  return dest === "document" || mode === "navigate";
 }
 
 function isAllowedTarget(
@@ -626,10 +621,6 @@ function buildUpstreamHeaders(
     "x-requested-with",
     "cache-control",
     "pragma",
-    "sec-fetch-dest",
-    "sec-fetch-mode",
-    "sec-fetch-site",
-    "sec-fetch-user",
   ];
 
   for (const name of passHeaders) {
