@@ -334,7 +334,6 @@ function shouldBypassResolvedMediaCache(url: URL): boolean {
   const p = url.pathname.toLowerCase();
 
   return (
-    h.includes("railway.app") ||
     h.includes("pyazzindex-production.up.railway.app") ||
     p.includes("/d/")
   );
@@ -380,6 +379,12 @@ function isTopLevelDocumentRequest(req: Request): boolean {
   const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
   const mode = (req.headers.get("sec-fetch-mode") || "").toLowerCase();
   return dest === "document" || mode === "navigate";
+}
+
+// FIX 1: Identify Meilisearch API requests so they are NOT treated as media
+function isMeilisearchApiRequest(url: URL): boolean {
+  const h = url.hostname.toLowerCase();
+  return h.includes("getmeilimeilisearchv190-production") && h.endsWith(".railway.app");
 }
 
 function isAllowedTarget(
@@ -569,10 +574,17 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
+// FIX 1: Exclude Meilisearch API from being treated as media
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
+  // Meilisearch API on railway.app is NOT media
+  if (isMeilisearchApiRequest(url)) return false;
+
   const path = url.pathname.toLowerCase();
   const host = url.hostname.toLowerCase();
   const accept = (req.headers.get("accept") || "").toLowerCase();
+
+  // pyazzindex API on railway.app is NOT media either
+  if (host.includes("pyazzindex-production") && host.endsWith(".railway.app")) return false;
 
   return (
     path.endsWith(".mp4") ||
@@ -796,11 +808,13 @@ function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
   });
 
   css = css.replace(
-    /@import\s+url\(\s*["']?([^"')]+)["']?\s*\)/gi,
-    (m, link) => {
-      if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) return m;
+    /@import\s+url\s*\(\s*["']?([^"')]+?)["']?\s*\)/gi,
+    (_m, link) => {
+      if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) {
+        return `url("${link}")`;
+      }
       const abs = toAbs(link, baseUrl);
-      return abs ? `@import url("${proxyBase}${abs}")` : m;
+      return abs ? `url("${proxyBase}${abs}")` : `url("${link}")`;
     },
   );
 
@@ -808,13 +822,16 @@ function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
 }
 
 function rewriteCssUrls(css: string, baseUrl: string, proxyBase: string): string {
-  return css.replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, (_m, link) => {
-    if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) {
-      return `url("${link}")`;
-    }
-    const abs = toAbs(link, baseUrl);
-    return abs ? `url("${proxyBase}${abs}")` : `url("${link}")`;
-  });
+  return css.replace(
+    /url\s*\(\s*["']?([^"')]+?)["']?\s*\)/gi,
+    (_m, link) => {
+      if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) {
+        return `url("${link}")`;
+      }
+      const abs = toAbs(link, baseUrl);
+      return abs ? `url("${proxyBase}${abs}")` : `url("${link}")`;
+    },
+  );
 }
 
 function shouldProxy(value: string): boolean {
@@ -876,91 +893,6 @@ function shouldIgnoreDebugUrl(url){
   }
 }
 
-function createDebugBox(){
-  try{
-    if(document.getElementById('__proxy_debug_box')) return;
-
-    var box = document.createElement('div');
-    box.id = '__proxy_debug_box';
-    box.style.position = 'fixed';
-    box.style.left = '8px';
-    box.style.right = '8px';
-    box.style.bottom = '8px';
-    box.style.zIndex = '999999';
-    box.style.maxHeight = '35vh';
-    box.style.overflow = 'auto';
-    box.style.background = 'rgba(0,0,0,0.92)';
-    box.style.color = '#fff';
-    box.style.fontSize = '12px';
-    box.style.lineHeight = '1.4';
-    box.style.padding = '10px';
-    box.style.border = '1px solid rgba(255,255,255,0.2)';
-    box.style.borderRadius = '10px';
-    box.style.wordBreak = 'break-word';
-    box.style.display = 'none';
-
-    var title = document.createElement('div');
-    title.textContent = 'Proxy Debug';
-    title.style.fontWeight = '700';
-    title.style.marginBottom = '6px';
-    box.appendChild(title);
-
-    var closeBtn = document.createElement('button');
-    closeBtn.textContent = '×';
-    closeBtn.style.position = 'absolute';
-    closeBtn.style.top = '6px';
-    closeBtn.style.right = '8px';
-    closeBtn.style.background = 'transparent';
-    closeBtn.style.color = '#fff';
-    closeBtn.style.border = 'none';
-    closeBtn.style.fontSize = '18px';
-    closeBtn.onclick = function(){ box.style.display = 'none'; };
-    box.appendChild(closeBtn);
-
-    var content = document.createElement('div');
-    content.id = '__proxy_debug_content';
-    box.appendChild(content);
-
-    document.documentElement.appendChild(box);
-  }catch(e){}
-}
-
-function reportFail(type, url, extra){
-  try{
-    if (shouldIgnoreDebugUrl(url)) return;
-
-    createDebugBox();
-    var box = document.getElementById('__proxy_debug_box');
-    var content = document.getElementById('__proxy_debug_content');
-    if(!box || !content) return;
-
-    box.style.display = 'block';
-
-    var item = document.createElement('div');
-    item.style.padding = '6px 0';
-    item.style.borderTop = '1px solid rgba(255,255,255,0.12)';
-
-    var t = document.createElement('div');
-    t.style.color = '#ff8080';
-    t.style.fontWeight = '700';
-    t.textContent = type;
-    item.appendChild(t);
-
-    var u = document.createElement('div');
-    u.textContent = url || '(no url)';
-    item.appendChild(u);
-
-    if(extra){
-      var e = document.createElement('div');
-      e.style.color = '#ccc';
-      e.textContent = extra;
-      item.appendChild(e);
-    }
-
-    content.prepend(item);
-  }catch(e){}
-}
-
 var PROXY_BASE = ${JSON.stringify(proxyBase)};
 var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
 var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
@@ -992,6 +924,9 @@ function isAppRoute(u){
 function isMediaLike(u){
   if(!u || typeof u !== 'string') return false;
   u = u.toLowerCase();
+  // Do NOT treat meilisearch or pyazzindex railway URLs as media
+  if(u.indexOf('getmeilimeilisearchv190-production') !== -1) return false;
+  if(u.indexOf('pyazzindex-production') !== -1) return false;
   return (
     u.indexOf('/d/') !== -1 ||
     u.indexOf('.mp4') !== -1 ||
@@ -1056,17 +991,6 @@ function toLocalProxyRoute(u){
   }catch(e){}
 
   return null;
-}
-
-function addRetryParam(url){
-  try{
-    var u = new URL(url, location.href);
-    u.searchParams.set('_pvretry', String(Date.now()));
-    return u.href;
-  }catch(e){
-    var sep = String(url).indexOf('?') === -1 ? '?' : '&';
-    return String(url) + sep + '_pvretry=' + Date.now();
-  }
 }
 
 function proxify(u){
@@ -1195,6 +1119,59 @@ function hideUnsupportedTabs(root){
   }catch(e){}
 }
 
+// FIX 2: Show movie titles below poster images
+function showMovieTitles(root){
+  try{
+    var cards = (root && root.querySelectorAll ? root : document).querySelectorAll('a[href*="/video/"]');
+    for(var i = 0; i < cards.length; i++){
+      var card = cards[i];
+      if(card.getAttribute('data-proxy-title-added') === '1') continue;
+
+      // Find the image inside the card
+      var img = card.querySelector('img');
+      if(!img) continue;
+
+      // Try to get the title from alt text or title attribute
+      var title = img.getAttribute('alt') || img.getAttribute('title') || '';
+
+      // If no title from image, try to extract from the URL
+      if(!title){
+        try{
+          var href = card.getAttribute('href') || '';
+          var match = href.match(/\\/video\\/([a-z0-9-]+)/i);
+          if(match){
+            title = match[1].replace(/-/g, ' ').replace(/\\b\\w/g, function(c){ return c.toUpperCase(); });
+          }
+        }catch(e){}
+      }
+
+      if(!title) continue;
+
+      // Check if there's already a visible title element
+      var existingTitle = card.querySelector('.movie-title, .title, [class*="title"], [class*="name"]');
+      if(existingTitle && existingTitle.textContent.trim()) {
+        card.setAttribute('data-proxy-title-added', '1');
+        continue;
+      }
+
+      // Create a title element
+      var titleEl = document.createElement('div');
+      titleEl.className = 'proxy-movie-title';
+      titleEl.textContent = title;
+      titleEl.style.cssText = 'display:block;width:100%;text-align:center;color:#fff;font-size:12px;line-height:1.3;padding:4px 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;background:rgba(0,0,0,0.6);border-radius:0 0 6px 6px;margin-top:-4px;';
+
+      card.style.display = 'inline-flex';
+      card.style.flexDirection = 'column';
+      card.style.alignItems = 'center';
+      card.style.overflow = 'hidden';
+
+      card.appendChild(titleEl);
+      card.setAttribute('data-proxy-title-added', '1');
+    }
+  }catch(e){}
+}
+
+// FIX 3: Completely rewritten video patching - no more aggressive auto-retry/refresh
 function patchVideoElements(root){
   try{
     var vids = [];
@@ -1213,43 +1190,40 @@ function patchVideoElements(root){
       if(!v || v.__proxyPatched) continue;
       v.__proxyPatched = true;
 
+      // Only handle genuine fatal errors, not transient ones
+      // Do NOT auto-retry or auto-reload - this causes the restart loop
       (function(video){
-        var retries = 0;
-        var timer = 0;
+        var errorCount = 0;
 
-        function retry(){
-          if(retries >= 2) return;
-          retries++;
+        video.addEventListener('error', function(e){
+          errorCount++;
+          // Only log, do NOT auto-reload/retry
+          // The browser handles buffering and recovery on its own
+          try{
+            var src = video.currentSrc || video.getAttribute('src') || '';
+            console.log('[Proxy] Video error #' + errorCount + ' for: ' + src);
+          }catch(ex){}
+        });
 
-          clearTimeout(timer);
-          timer = setTimeout(function(){
-            try{
-              var src = video.currentSrc || video.getAttribute('src') || '';
-              var source = !src ? video.querySelector('source[src]') : null;
-              if(!src && source) src = source.getAttribute('src') || '';
-              if(!src) return;
-
-              var next = addRetryParam(src);
-
-              if(source){
-                source.setAttribute('src', next);
-                if(video.getAttribute('src')) video.removeAttribute('src');
-              }else{
-                video.setAttribute('src', next);
-              }
-
-              video.load();
-              var p = video.play && video.play();
-              if(p && p.catch) p.catch(function(){});
-            }catch(e){}
-          }, retries === 1 ? 800 : 1800);
-        }
-
-        video.addEventListener('error', retry);
-        video.addEventListener('stalled', retry);
-        video.addEventListener('emptied', retry);
-        video.addEventListener('abort', retry);
-        video.addEventListener('loadeddata', function(){ retries = 0; });
+        // Prevent any external code from calling load() repeatedly
+        var origLoad = video.load.bind(video);
+        var loadCount = 0;
+        var lastLoadTime = 0;
+        video.load = function(){
+          var now = Date.now();
+          // Throttle: allow load() at most once every 3 seconds
+          if(now - lastLoadTime < 3000){
+            loadCount++;
+            if(loadCount > 2){
+              console.log('[Proxy] Blocked excessive video.load() call #' + loadCount);
+              return;
+            }
+          } else {
+            loadCount = 0;
+          }
+          lastLoadTime = now;
+          return origLoad();
+        };
       })(v);
     }
   }catch(e){}
@@ -1276,15 +1250,9 @@ try{
     persistTargetOrigin();
 
     return originalFetch.call(this, input, init).then(function(res){
-      try{
-        var showUrl = res && res.url ? res.url : finalUrl;
-        if(!res.ok){
-          reportFail('FETCH FAIL ' + res.status, showUrl, res.statusText || '');
-        }
-      }catch(e){}
       return res;
     }).catch(function(err){
-      reportFail('FETCH ERROR', finalUrl, String(err));
+      console.warn('[Proxy] Fetch error for:', finalUrl, err);
       throw err;
     });
   };
@@ -1299,36 +1267,10 @@ try{
       arguments[1] = finalUrl;
     }
 
-    this.addEventListener('load', function(){
-      try{
-        if(this.status >= 400){
-          reportFail('XHR FAIL ' + this.status, finalUrl, this.statusText || '');
-        }
-      }catch(e){}
-    });
-
-    this.addEventListener('error', function(){
-      reportFail('XHR ERROR', finalUrl, 'network error');
-    });
-
     persistTargetOrigin();
     return originalXhrOpen.apply(this, arguments);
   };
 }catch(e){}
-
-window.addEventListener('error', function(e){
-  try{
-    reportFail('WINDOW ERROR', e.filename || '', e.message || '');
-  }catch(err){}
-});
-
-window.addEventListener('unhandledrejection', function(e){
-  try{
-    var msg = '';
-    try{ msg = String(e.reason); }catch(_) {}
-    reportFail('PROMISE ERROR', '', msg);
-  }catch(err){}
-});
 
 try{
   var pushState = history.pushState;
@@ -1464,6 +1406,7 @@ function rewriteTree(root){
 
   hideUnsupportedTabs(root);
   patchVideoElements(root);
+  showMovieTitles(root);
 
   rewriteNode(root);
   try{
@@ -1475,6 +1418,7 @@ function rewriteTree(root){
 
   hideUnsupportedTabs(root);
   patchVideoElements(root);
+  showMovieTitles(root);
 }
 
 var mo = new MutationObserver(function(muts){
@@ -1502,12 +1446,14 @@ if(document.readyState === 'loading'){
     persistTargetOrigin();
     hideUnsupportedTabs(document);
     patchVideoElements(document);
+    showMovieTitles(document);
     rewriteTree(document.documentElement);
   });
 }else{
   persistTargetOrigin();
   hideUnsupportedTabs(document);
   patchVideoElements(document);
+  showMovieTitles(document);
   rewriteTree(document.documentElement);
 }
 
@@ -1515,9 +1461,10 @@ window.addEventListener('load', function(){
   persistTargetOrigin();
   hideUnsupportedTabs(document);
   patchVideoElements(document);
+  showMovieTitles(document);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
-  setTimeout(function(){ hideUnsupportedTabs(document); patchVideoElements(document); }, 1600);
+  setTimeout(function(){ hideUnsupportedTabs(document); patchVideoElements(document); showMovieTitles(document); }, 1600);
 });
 
 try{
