@@ -1253,6 +1253,26 @@ function decoratePosterTitles(root){
     }
   }catch(e){}
 }
+function hideHeaderBrand(root){
+  try{
+    var nodes = [];
+    try{
+      var found = (root && root.querySelectorAll ? root : document).querySelectorAll('h1,h2,h3,h4,div,span,a,p');
+      for(var i=0;i<found.length;i++) nodes.push(found[i]);
+    }catch(e){}
+
+    for(var j=0;j<nodes.length;j++){
+      var el = nodes[j];
+      if(!el || el.getAttribute('data-proxy-brand-hidden') === '1') continue;
+
+      var txt = (el.textContent || '').trim().toLowerCase();
+      if(txt === 'pyazz.com'){
+        el.setAttribute('data-proxy-brand-hidden', '1');
+        el.style.display = 'none';
+      }
+    }
+  }catch(e){}
+}
 
 function patchVideoElements(root){
   try{
