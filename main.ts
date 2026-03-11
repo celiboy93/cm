@@ -1,6 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
 const PORT = 8000;
 const PROXY_PREFIX = "/proxy/";
+const TARGET_COOKIE = "__proxy_target_origin";
 
 Deno.serve({ port: PORT }, handler);
 console.log(`Proxy running on http://localhost:${PORT}`);
@@ -41,7 +42,6 @@ async function handler(req: Request): Promise<Response> {
   try {
     const targetUrl = new URL(target);
 
-    // self loop block
     if (targetUrl.origin === proxyOrigin) {
       return new Response(
         errorPage(
@@ -73,6 +73,7 @@ async function handler(req: Request): Promise<Response> {
     const contentType = upstream.headers.get("content-type") || "";
     const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
 
+    // upstream redirect -> proxied redirect
     if ([301, 302, 303, 307, 308].includes(upstream.status)) {
       const loc = upstream.headers.get("location");
       if (loc) {
@@ -80,19 +81,36 @@ async function handler(req: Request): Promise<Response> {
         outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs);
       }
 
+      // html route navigation အတွက် origin cookie update
+      outHeaders.append(
+        "set-cookie",
+        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+      );
+
       return new Response(null, {
         status: upstream.status,
         headers: outHeaders,
       });
     }
 
+    // HTML
     if (contentType.includes("text/html")) {
       let html = await upstream.text();
-      html = rewriteHtml(html, targetUrl.href, proxyOrigin + PROXY_PREFIX, targetUrl.origin);
+      html = rewriteHtml(
+        html,
+        targetUrl.href,
+        proxyOrigin + PROXY_PREFIX,
+        targetUrl.origin,
+      );
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
       outHeaders.set("content-type", "text/html; charset=utf-8");
+
+      outHeaders.append(
+        "set-cookie",
+        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+      );
 
       return new Response(html, {
         status: upstream.status,
@@ -100,6 +118,7 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
+    // CSS
     if (contentType.includes("text/css")) {
       let css = await upstream.text();
       css = rewriteCss(css, targetUrl.href, proxyOrigin + PROXY_PREFIX);
@@ -114,18 +133,25 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
+    // JS - do not rewrite chunk text
     if (
       contentType.includes("javascript") ||
       contentType.includes("application/javascript") ||
       contentType.includes("text/javascript") ||
       contentType.includes("application/x-javascript")
     ) {
+      outHeaders.append(
+        "set-cookie",
+        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+      );
+
       return new Response(upstream.body, {
         status: upstream.status,
         headers: outHeaders,
       });
     }
 
+    // JSON
     if (
       contentType.includes("application/json") ||
       contentType.includes("+json")
@@ -134,11 +160,22 @@ async function handler(req: Request): Promise<Response> {
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
 
+      outHeaders.append(
+        "set-cookie",
+        `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+      );
+
       return new Response(txt, {
         status: upstream.status,
         headers: outHeaders,
       });
     }
+
+    // video / image / font / binary / stream
+    outHeaders.append(
+      "set-cookie",
+      `${TARGET_COOKIE}=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`,
+    );
 
     return new Response(upstream.body, {
       status: upstream.status,
@@ -169,9 +206,16 @@ function extractTargetUrl(req: Request, url: URL): string {
   }
 
   if (url.pathname !== "/") {
-    const origin = inferOriginFromReferer(req);
-    if (origin) {
-      return origin + url.pathname + url.search;
+    // 1) referer origin
+    const refererOrigin = inferOriginFromReferer(req);
+    if (refererOrigin) {
+      return refererOrigin + url.pathname + url.search;
+    }
+
+    // 2) cookie fallback
+    const cookieOrigin = getCookie(req, TARGET_COOKIE);
+    if (cookieOrigin && /^https?:\/\//i.test(cookieOrigin)) {
+      return cookieOrigin + url.pathname + url.search;
     }
   }
 
@@ -204,6 +248,20 @@ function inferOriginFromReferer(req: Request): string {
   } catch {
     return "";
   }
+}
+
+function getCookie(req: Request, name: string): string {
+  const cookie = req.headers.get("cookie") || "";
+  const parts = cookie.split(";");
+
+  for (const part of parts) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) {
+      return decodeURIComponent(rest.join("=") || "");
+    }
+  }
+
+  return "";
 }
 
 function normalizeProxyTarget(
@@ -286,7 +344,10 @@ function buildUpstreamHeaders(req: Request, targetUrl: URL): Headers {
     "accept-language",
     req.headers.get("accept-language") || "en-US,en;q=0.9",
   );
+
+  // response text rewrite အတွက် compressed မယူ
   h.set("accept-encoding", "identity");
+
   h.set("referer", targetUrl.origin + "/");
   h.set("origin", targetUrl.origin);
 
@@ -365,6 +426,7 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   h.set("access-control-allow-headers", "*");
   h.set("access-control-expose-headers", "*");
 
+  // restrictive headers strip
   h.delete("content-security-policy");
   h.delete("content-security-policy-report-only");
   h.delete("x-frame-options");
@@ -513,6 +575,13 @@ function injectedScript(
 var PROXY_BASE = ${JSON.stringify(proxyBase)};
 var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
 var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
+var TARGET_COOKIE = ${JSON.stringify(TARGET_COOKIE)};
+
+function persistTargetOrigin(){
+  try{
+    document.cookie = TARGET_COOKIE + "=" + encodeURIComponent(TARGET_ORIGIN) + "; path=/; SameSite=Lax";
+  }catch(e){}
+}
 
 function currentTargetPage(){
   try{
@@ -572,6 +641,8 @@ function rewriteSrcset(v){
   }
 }
 
+persistTargetOrigin();
+
 try{
   var originalFetch = window.fetch;
   window.fetch = function(input, init){
@@ -585,6 +656,7 @@ try{
         }
       }
     }catch(e){}
+    persistTargetOrigin();
     return originalFetch.call(this, input, init);
   };
 }catch(e){}
@@ -595,6 +667,7 @@ try{
     if(arguments.length >= 2 && typeof arguments[1] === 'string'){
       arguments[1] = proxify(arguments[1]);
     }
+    persistTargetOrigin();
     return originalXhrOpen.apply(this, arguments);
   };
 }catch(e){}
@@ -609,6 +682,7 @@ try{
         u = proxify(u);
       }
     }
+    persistTargetOrigin();
     return pushState.call(this, s, t, u);
   };
 
@@ -618,6 +692,7 @@ try{
         u = proxify(u);
       }
     }
+    persistTargetOrigin();
     return replaceState.call(this, s, t, u);
   };
 }catch(e){}
@@ -625,6 +700,7 @@ try{
 try{
   var winOpen = window.open;
   window.open = function(u,n,f){
+    persistTargetOrigin();
     return winOpen.call(this, u ? proxify(u) : u, n, f);
   };
 }catch(e){}
@@ -664,11 +740,13 @@ document.addEventListener('click', function(e){
 
     if(href && !/^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href.trim())){
       if(href.indexOf(PROXY_BASE) === 0 || href.indexOf('/proxy/http') !== -1){
+        persistTargetOrigin();
         return;
       }
 
       e.preventDefault();
       e.stopPropagation();
+      persistTargetOrigin();
       location.href = proxify(href);
       return false;
     }
@@ -682,6 +760,7 @@ document.addEventListener('submit', function(e){
     if(action.indexOf(PROXY_BASE) !== 0 && action.indexOf('/proxy/http') === -1){
       f.setAttribute('action', proxify(action));
     }
+    persistTargetOrigin();
   }
 }, true);
 
@@ -736,13 +815,16 @@ if(document.documentElement){
 
 if(document.readyState === 'loading'){
   document.addEventListener('DOMContentLoaded', function(){
+    persistTargetOrigin();
     rewriteTree(document.documentElement);
   });
 }else{
+  persistTargetOrigin();
   rewriteTree(document.documentElement);
 }
 
 window.addEventListener('load', function(){
+  persistTargetOrigin();
   setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
 });
@@ -762,7 +844,7 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] loop-safe SPA rewrite active');
+console.log('[Proxy] cookie-fallback SPA rewrite active');
 })();
 <\/script>`;
 }
@@ -803,16 +885,18 @@ h1{margin:0 0 12px}
 p{color:#cbd5e1}
 input{width:100%;padding:14px;border-radius:10px;border:1px solid #475569;background:#0b1220;color:#fff;margin:14px 0}
 button{width:100%;padding:14px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700}
+small{display:block;margin-top:12px;color:#94a3b8}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>Deno Proxy</h1>
-  <p>URL ထည့်ပြီး browse လုပ်ပါ</p>
+  <p>pyazz.com လို SPA site တွေအတွက် cookie fallback ပါတဲ့ proxy</p>
   <form onsubmit="go(event)">
     <input id="u" type="text" placeholder="https://pyazz.com" required>
     <button type="submit">Browse</button>
   </form>
+  <small>Example: https://pyazz.com</small>
 </div>
 <script>
 function go(e){
