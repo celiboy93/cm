@@ -2,6 +2,7 @@
 const PORT = 8000;
 const PROXY_PREFIX = "/proxy/";
 const TARGET_COOKIE = "__proxy_target_origin";
+const DEFAULT_TARGET_ORIGIN = "https://pyazz.com";
 
 // ===== pyazz-only config =====
 const PYAZZ_ORIGINS = new Set([
@@ -36,7 +37,53 @@ const detailHtmlCache = new Map<string, DetailCacheEntry>();
 const mediaResolveCache = new Map<string, ResolveCacheEntry>();
 
 Deno.serve({ port: PORT }, handler);
-console.log(`Pyazz-only proxy running on http://localhost:${PORT}`);
+console.log(`Pyazz-only proxy (clean URL) running on http://localhost:${PORT}`);
+
+// ===== Clean URL helpers =====
+function isPyazzAppPath(pathname: string): boolean {
+  const p = pathname.toLowerCase();
+  return (
+    p === "/" ||
+    p.startsWith("/video/") ||
+    p.startsWith("/movies") ||
+    p.startsWith("/search") ||
+    p.startsWith("/genre") ||
+    p.startsWith("/country") ||
+    p.startsWith("/year") ||
+    p.startsWith("/_next/") ||
+    p.startsWith("/favicon") ||
+    p.startsWith("/images/") ||
+    p.startsWith("/api/") ||
+    p.startsWith("/manifest") ||
+    p.startsWith("/sitemap") ||
+    p.startsWith("/robots") ||
+    p.endsWith(".js") ||
+    p.endsWith(".css") ||
+    p.endsWith(".png") ||
+    p.endsWith(".jpg") ||
+    p.endsWith(".jpeg") ||
+    p.endsWith(".gif") ||
+    p.endsWith(".svg") ||
+    p.endsWith(".ico") ||
+    p.endsWith(".webp") ||
+    p.endsWith(".json") ||
+    p.endsWith(".woff2") ||
+    p.endsWith(".woff") ||
+    p.endsWith(".ttf") ||
+    p.endsWith(".xml") ||
+    p.endsWith(".txt")
+  );
+}
+
+function toPyazzCleanPath(absUrl: string): string | null {
+  try {
+    const parsed = new URL(absUrl);
+    if (isPyazzOrigin(parsed.origin)) {
+      return parsed.pathname + parsed.search + parsed.hash;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 async function handler(req: Request): Promise<Response> {
   const reqUrl = new URL(req.url);
@@ -51,14 +98,30 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  if (reqUrl.pathname === "/" && !reqUrl.searchParams.has("url")) {
+  // Home page with no params → show landing or proxy pyazz.com root
+  if (
+    reqUrl.pathname === "/" &&
+    !reqUrl.searchParams.has("url") &&
+    !reqUrl.searchParams.toString()
+  ) {
     return new Response(homePage(), {
       status: 200,
       headers: htmlHeaders(),
     });
   }
 
-  let target = extractTargetUrl(req, reqUrl);
+  let target = "";
+
+  // ===== CLEAN URL MODE =====
+  if (
+    !reqUrl.pathname.startsWith(PROXY_PREFIX) &&
+    !reqUrl.searchParams.has("url") &&
+    isPyazzAppPath(reqUrl.pathname)
+  ) {
+    target = DEFAULT_TARGET_ORIGIN + reqUrl.pathname + reqUrl.search;
+  } else {
+    target = extractTargetUrl(req, reqUrl);
+  }
 
   if (!target) {
     return new Response("URL not found", {
@@ -90,8 +153,11 @@ async function handler(req: Request): Promise<Response> {
     }
 
     const cookieOrigin = getCookie(req, TARGET_COOKIE) || "";
-    const refererOrigin = inferOriginFromReferer(req) || "";
-    const pyazzContext = isPyazzOrigin(cookieOrigin) || isPyazzOrigin(refererOrigin);
+    const refererOrigin = inferOriginFromReferer(req, proxyOrigin) || "";
+    const pyazzContext =
+      isPyazzOrigin(cookieOrigin) ||
+      isPyazzOrigin(refererOrigin) ||
+      isPyazzOrigin(targetUrl.origin);
 
     if (!isAllowedTarget(targetUrl, req, pyazzContext)) {
       return new Response(
@@ -138,8 +204,13 @@ async function handler(req: Request): Promise<Response> {
     if (!effectiveIsMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
       const loc = upstream.headers.get("location");
       if (loc) {
-        const abs = new URL(loc, effectiveTargetUrl.href).href;
-        outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs);
+        const abs = new URL(loc, effectiveTargetUrl.href);
+        const cleanPath = toPyazzCleanPath(abs.href);
+        if (cleanPath) {
+          outHeaders.set("location", cleanPath);
+        } else {
+          outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs.href);
+        }
       }
 
       outHeaders.append(
@@ -158,7 +229,8 @@ async function handler(req: Request): Promise<Response> {
       html = rewriteHtml(
         html,
         effectiveTargetUrl.href,
-        proxyOrigin + PROXY_PREFIX,
+        proxyOrigin,
+        PROXY_PREFIX,
         cookieOrigin || targetUrl.origin,
       );
 
@@ -192,7 +264,7 @@ async function handler(req: Request): Promise<Response> {
 
     if (contentType.includes("text/css")) {
       let css = await upstream.text();
-      css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX);
+      css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin, PROXY_PREFIX);
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
@@ -261,6 +333,7 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
+// ===== Upstream fetch with retry =====
 async function fetchUpstreamWithRetry(
   req: Request,
   originalTargetUrl: URL,
@@ -367,6 +440,7 @@ function shouldRetryMediaStatus(status: number): boolean {
   return [401, 403, 404, 410, 429, 500, 502, 503, 504].includes(status);
 }
 
+// ===== Origin / host checks =====
 function isPyazzOrigin(origin: string): boolean {
   return PYAZZ_ORIGINS.has(origin.toLowerCase());
 }
@@ -405,6 +479,7 @@ function isAllowedTarget(
   return false;
 }
 
+// ===== Cache helpers =====
 function cleanupCaches() {
   const now = Date.now();
 
@@ -435,6 +510,7 @@ function isDetailLikePage(url: URL): boolean {
   );
 }
 
+// ===== URL extraction =====
 function extractTargetUrl(req: Request, url: URL): string {
   if (url.pathname.startsWith(PROXY_PREFIX)) {
     const idx = req.url.indexOf(PROXY_PREFIX);
@@ -448,7 +524,7 @@ function extractTargetUrl(req: Request, url: URL): string {
   }
 
   if (url.pathname !== "/") {
-    const refererOrigin = inferOriginFromReferer(req);
+    const refererOrigin = inferOriginFromReferer(req, new URL(req.url).origin);
     if (refererOrigin) {
       return refererOrigin + url.pathname + url.search;
     }
@@ -457,12 +533,15 @@ function extractTargetUrl(req: Request, url: URL): string {
     if (cookieOrigin && /^https?:\/\//i.test(cookieOrigin)) {
       return cookieOrigin + url.pathname + url.search;
     }
+
+    // Clean URL fallback: default target
+    return DEFAULT_TARGET_ORIGIN + url.pathname + url.search;
   }
 
   return "";
 }
 
-function inferOriginFromReferer(req: Request): string {
+function inferOriginFromReferer(req: Request, proxyOrigin: string): string {
   const referer =
     req.headers.get("referer") ||
     req.headers.get("referrer") ||
@@ -472,18 +551,28 @@ function inferOriginFromReferer(req: Request): string {
 
   try {
     const idx = referer.indexOf(PROXY_PREFIX);
-    if (idx === -1) return "";
+    if (idx !== -1) {
+      let after = referer.substring(idx + PROXY_PREFIX.length);
+      const hashIdx = after.indexOf("#");
+      if (hashIdx !== -1) after = after.slice(0, hashIdx);
 
-    let after = referer.substring(idx + PROXY_PREFIX.length);
-    const hashIdx = after.indexOf("#");
-    if (hashIdx !== -1) after = after.slice(0, hashIdx);
-
-    try {
-      return new URL(after).origin;
-    } catch {
-      const m = after.match(/^https?:\/\/[^/]+/i);
-      return m ? m[0] : "";
+      try {
+        return new URL(after).origin;
+      } catch {
+        const m = after.match(/^https?:\/\/[^/]+/i);
+        return m ? m[0] : "";
+      }
     }
+
+    // Clean URL mode: referer is from proxy itself → default target
+    try {
+      const refUrl = new URL(referer);
+      if (refUrl.origin === proxyOrigin) {
+        return DEFAULT_TARGET_ORIGIN;
+      }
+    } catch { /* ignore */ }
+
+    return "";
   } catch {
     return "";
   }
@@ -569,6 +658,7 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
+// ===== Media detection =====
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
   const path = url.pathname.toLowerCase();
   const host = url.hostname.toLowerCase();
@@ -588,6 +678,7 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
   );
 }
 
+// ===== Header builders =====
 function filterOutgoingCookie(cookieHeader: string): string {
   const parts = cookieHeader
     .split(";")
@@ -680,13 +771,19 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
     if (sc) h.set("set-cookie", sc);
   }
 
+  // Rewrite location header: pyazz → clean path, others → /proxy/
   const loc = h.get("location");
   if (loc) {
     try {
-      const abs = new URL(loc).href;
-      h.set("location", proxyOrigin + PROXY_PREFIX + abs);
+      const abs = new URL(loc);
+      const cleanPath = toPyazzCleanPath(abs.href);
+      if (cleanPath) {
+        h.set("location", cleanPath);
+      } else {
+        h.set("location", proxyOrigin + PROXY_PREFIX + abs.href);
+      }
     } catch {
-      // ignore
+      // relative — leave as-is
     }
   }
 
@@ -710,12 +807,16 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   return h;
 }
 
+// ===== HTML rewriting (clean URL mode) =====
 function rewriteHtml(
   html: string,
   baseUrl: string,
-  proxyBase: string,
+  proxyOrigin: string,
+  proxyPrefix: string,
   targetOrigin: string,
 ): string {
+  const proxyBase = proxyOrigin + proxyPrefix;
+
   html = html.replace(/<base\s[^>]*>/gi, "");
   html = html.replace(/\s+integrity\s*=\s*["'][^"']*["']/gi, "");
   html = html.replace(/\s+nonce\s*=\s*["'][^"']*["']/gi, "");
@@ -725,15 +826,31 @@ function rewriteHtml(
     "",
   );
 
+  function cleanProxify(value: string): string | null {
+    if (!shouldProxy(value)) return null;
+    const abs = toAbs(value, baseUrl);
+    if (!abs) return null;
+
+    try {
+      const parsed = new URL(abs);
+      if (isPyazzOrigin(parsed.origin)) {
+        return parsed.pathname + parsed.search + parsed.hash;
+      }
+      return proxyBase + abs;
+    } catch {
+      return proxyBase + abs;
+    }
+  }
+
   html = html.replace(
     /((?:href|src|action|poster)\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, value) => {
       if (!shouldProxy(value) || isAlreadyProxied(value, proxyBase)) {
         return `${prefix}${quote}${value}${quote}`;
       }
-      const abs = toAbs(value, baseUrl);
-      return abs
-        ? `${prefix}${quote}${proxyBase}${abs}${quote}`
+      const rewritten = cleanProxify(value);
+      return rewritten
+        ? `${prefix}${quote}${rewritten}${quote}`
         : `${prefix}${quote}${value}${quote}`;
     },
   );
@@ -751,8 +868,8 @@ function rewriteHtml(
 
         if (!shouldProxy(url) || isAlreadyProxied(url, proxyBase)) return t;
 
-        const abs = toAbs(url, baseUrl);
-        return abs ? `${proxyBase}${abs}${desc}` : t;
+        const rewritten = cleanProxify(url);
+        return rewritten ? `${rewritten}${desc}` : t;
       });
 
       return `${prefix}${quote}${parts.join(", ")}${quote}`;
@@ -762,18 +879,18 @@ function rewriteHtml(
   html = html.replace(
     /(style\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, val) => {
-      return `${prefix}${quote}${rewriteCssUrls(val, baseUrl, proxyBase)}${quote}`;
+      return `${prefix}${quote}${rewriteCssUrls(val, baseUrl, proxyOrigin, proxyPrefix)}${quote}`;
     },
   );
 
   html = html.replace(
     /(<style[^>]*>)([\s\S]*?)(<\/style>)/gi,
     (_m, open, css, close) => {
-      return open + rewriteCss(css, baseUrl, proxyBase) + close;
+      return open + rewriteCss(css, baseUrl, proxyOrigin, proxyPrefix) + close;
     },
   );
 
-  const injected = injectedScript(proxyBase, targetOrigin, baseUrl);
+  const injected = injectedScript(proxyOrigin, proxyPrefix, targetOrigin, baseUrl);
 
   const headOpen = html.match(/<head[^>]*>/i);
   if (headOpen) {
@@ -786,13 +903,23 @@ function rewriteHtml(
   return html;
 }
 
-function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
-  css = rewriteCssUrls(css, baseUrl, proxyBase);
+// ===== CSS rewriting (clean URL mode) =====
+function rewriteCss(css: string, baseUrl: string, proxyOrigin: string, proxyPrefix: string): string {
+  const proxyBase = proxyOrigin + proxyPrefix;
+
+  css = rewriteCssUrls(css, baseUrl, proxyOrigin, proxyPrefix);
 
   css = css.replace(/@import\s+["']([^"']+)["']/gi, (m, link) => {
     if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) return m;
     const abs = toAbs(link, baseUrl);
-    return abs ? `@import "${proxyBase}${abs}"` : m;
+    if (!abs) return m;
+    try {
+      const parsed = new URL(abs);
+      if (isPyazzOrigin(parsed.origin)) {
+        return `@import "${parsed.pathname + parsed.search}"`;
+      }
+    } catch { /* fall through */ }
+    return `@import "${proxyBase}${abs}"`;
   });
 
   css = css.replace(
@@ -800,23 +927,40 @@ function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
     (m, link) => {
       if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) return m;
       const abs = toAbs(link, baseUrl);
-      return abs ? `@import url("${proxyBase}${abs}")` : m;
+      if (!abs) return m;
+      try {
+        const parsed = new URL(abs);
+        if (isPyazzOrigin(parsed.origin)) {
+          return `@import url("${parsed.pathname + parsed.search}")`;
+        }
+      } catch { /* fall through */ }
+      return `@import url("${proxyBase}${abs}")`;
     },
   );
 
   return css;
 }
 
-function rewriteCssUrls(css: string, baseUrl: string, proxyBase: string): string {
+function rewriteCssUrls(css: string, baseUrl: string, proxyOrigin: string, proxyPrefix: string): string {
+  const proxyBase = proxyOrigin + proxyPrefix;
+
   return css.replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, (_m, link) => {
     if (!shouldProxy(link) || isAlreadyProxied(link, proxyBase)) {
       return `url("${link}")`;
     }
     const abs = toAbs(link, baseUrl);
-    return abs ? `url("${proxyBase}${abs}")` : `url("${link}")`;
+    if (!abs) return `url("${link}")`;
+    try {
+      const parsed = new URL(abs);
+      if (isPyazzOrigin(parsed.origin)) {
+        return `url("${parsed.pathname + parsed.search}")`;
+      }
+    } catch { /* fall through */ }
+    return `url("${proxyBase}${abs}")`;
   });
 }
 
+// ===== Rewriting helpers =====
 function shouldProxy(value: string): boolean {
   if (!value) return false;
   return !/^(javascript:|data:|blob:|#|about:|mailto:|tel:)/i.test(value.trim());
@@ -834,8 +978,10 @@ function toAbs(value: string, baseUrl: string): string | null {
   }
 }
 
+// ===== Injected client-side script (clean URL mode) =====
 function injectedScript(
-  proxyBase: string,
+  proxyOrigin: string,
+  proxyPrefix: string,
   targetOrigin: string,
   currentPageUrl: string,
 ): string {
@@ -843,23 +989,34 @@ function injectedScript(
 (function(){
 'use strict';
 
+var PROXY_ORIGIN = ${JSON.stringify(proxyOrigin)};
+var PROXY_PREFIX = ${JSON.stringify(proxyPrefix)};
+var PROXY_BASE = PROXY_ORIGIN + PROXY_PREFIX;
+var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
+var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
+var TARGET_COOKIE = ${JSON.stringify(TARGET_COOKIE)};
+
 var UNSUPPORTED_PATHS = ['/tvshow', '/adults', '/review', '/trends', '/latest'];
 
 function isUnsupportedLocalPath(path){
   try{
-    var s = String(path || '').trim().toLowerCase();
+    var s = String(path || '').trim().toLowerCase().split('?')[0].split('#')[0];
     for(var i=0;i<UNSUPPORTED_PATHS.length;i++){
       var p = UNSUPPORTED_PATHS[i];
-      if(s === p || s.indexOf(p + '?') === 0 || s.indexOf(p + '#') === 0) return true;
+      if(s === p || s === p + '/') return true;
     }
   }catch(e){}
   return false;
 }
 
+function isPyazzOriginCheck(origin){
+  var o = String(origin || '').toLowerCase();
+  return o === 'https://pyazz.com' || o === 'https://www.pyazz.com';
+}
+
 function shouldIgnoreDebugUrl(url){
   try{
     var s = String(url || '');
-
     if(/google-analytics\\.com|googletagmanager\\.com/i.test(s)) return true;
     if(/\\/indexes\\/alist\\/search/i.test(s)) return true;
 
@@ -907,7 +1064,7 @@ function createDebugBox(){
     box.appendChild(title);
 
     var closeBtn = document.createElement('button');
-    closeBtn.textContent = '×';
+    closeBtn.textContent = '\\u00d7';
     closeBtn.style.position = 'absolute';
     closeBtn.style.top = '6px';
     closeBtn.style.right = '8px';
@@ -962,11 +1119,6 @@ function reportFail(type, url, extra){
   }catch(e){}
 }
 
-var PROXY_BASE = ${JSON.stringify(proxyBase)};
-var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
-var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
-var TARGET_COOKIE = ${JSON.stringify(TARGET_COOKIE)};
-
 function persistTargetOrigin(){
   try{
     document.cookie = TARGET_COOKIE + "=" + encodeURIComponent(TARGET_ORIGIN) + "; path=/; SameSite=Lax";
@@ -975,19 +1127,19 @@ function persistTargetOrigin(){
 
 function currentTargetPage(){
   try{
-    var p = location.pathname || '';
+    var p = location.pathname || '/';
+
+    // If we're on a /proxy/ path, extract the real URL
     var idx = p.indexOf('/proxy/');
     if(idx !== -1){
       var after = decodeURIComponent(p.substring(idx + 7)) + location.search + location.hash;
       if(/^https?:\\/\\//i.test(after)) return after;
     }
+
+    // Clean URL mode: path is the pyazz path directly
+    return TARGET_ORIGIN + p + location.search + location.hash;
   }catch(e){}
   return CURRENT_PAGE;
-}
-
-function isAppRoute(u){
-  if(!u || typeof u !== 'string') return false;
-  return /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(u.trim());
 }
 
 function isMediaLike(u){
@@ -1004,61 +1156,6 @@ function isMediaLike(u){
   );
 }
 
-function unwrapSelfProxyUrl(u){
-  try{
-    var s = String(u || '').trim();
-    var forms = [
-      location.origin + '/proxy/https://' + location.host,
-      location.origin + '/proxy/http://' + location.host,
-      '/proxy/https://' + location.host,
-      '/proxy/http://' + location.host
-    ];
-
-    for(var i=0;i<forms.length;i++){
-      if(s.indexOf(forms[i]) === 0){
-        var tail = s.substring(forms[i].length);
-        if(!tail.startsWith('/')) tail = '/' + tail;
-
-        if(isUnsupportedLocalPath(tail)) return '#';
-
-        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(tail)){
-          return tail;
-        }
-
-        return PROXY_BASE + TARGET_ORIGIN + tail;
-      }
-    }
-  }catch(e){}
-  return null;
-}
-
-function toLocalProxyRoute(u){
-  try{
-    if(typeof u !== 'string') return u;
-
-    if(isAppRoute(u)) return u;
-
-    var parsed = new URL(u, currentTargetPage());
-    var route = parsed.pathname + parsed.search + parsed.hash;
-
-    if(
-      parsed.origin === TARGET_ORIGIN &&
-      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
-    ){
-      return route;
-    }
-
-    if(
-      parsed.origin === location.origin &&
-      /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route)
-    ){
-      return route;
-    }
-  }catch(e){}
-
-  return null;
-}
-
 function addRetryParam(url){
   try{
     var u = new URL(url, location.href);
@@ -1070,78 +1167,79 @@ function addRetryParam(url){
   }
 }
 
+// ===== Core proxify (clean URL mode) =====
 function proxify(u){
   if(!u || typeof u !== 'string') return u;
   u = u.trim();
 
   if(/^(javascript:|data:|blob:|#|about:|mailto:|tel:)/i.test(u)) return u;
 
-  if(isUnsupportedLocalPath(u)) return '#';
+  // Unwrap self-proxy loops
+  var selfForms = [
+    location.origin + '/proxy/https://' + location.host,
+    location.origin + '/proxy/http://' + location.host,
+    '/proxy/https://' + location.host,
+    '/proxy/http://' + location.host
+  ];
+  for(var i=0;i<selfForms.length;i++){
+    if(u.indexOf(selfForms[i]) === 0){
+      var tail = u.substring(selfForms[i].length);
+      if(tail && tail.charAt(0) !== '/') tail = '/' + tail;
+      if(!tail) tail = '/';
+      if(isUnsupportedLocalPath(tail)) return '#';
+      return tail;
+    }
+  }
 
-  var selfFixed = unwrapSelfProxyUrl(u);
-  if(selfFixed !== null) return selfFixed;
-
-  var localRoute = toLocalProxyRoute(u);
-  if(localRoute) return localRoute;
-
+  // Already has /proxy/ prefix
   if(u.indexOf(PROXY_BASE) === 0) return u;
   if(u.indexOf('/proxy/http') !== -1) return u;
 
-  try{
-    var parsedDirect = new URL(u);
-    var directRoute = parsedDirect.pathname + parsedDirect.search + parsedDirect.hash;
-
-    if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') !== 0){
-      if(isUnsupportedLocalPath(directRoute)) return '#';
-
-      if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(directRoute)){
-        return directRoute;
-      }
-
-      return PROXY_BASE + TARGET_ORIGIN + directRoute;
-    }
-
-    if(parsedDirect.origin === location.origin && parsedDirect.pathname.indexOf('/proxy/') === 0){
-      return u;
-    }
-  }catch(e){}
-
-  try{
-    var abs = new URL(u, currentTargetPage()).href;
-
-    if(isMediaLike(abs)){
-      return PROXY_BASE + abs;
-    }
-
-    try{
-      var parsedAbs = new URL(abs);
-      var route2 = parsedAbs.pathname + parsedAbs.search + parsedAbs.hash;
-
-      if(isUnsupportedLocalPath(route2)) return '#';
-
-      if(
-        parsedAbs.origin === TARGET_ORIGIN &&
-        /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)
-      ){
-        return route2;
-      }
-
-      if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') !== 0){
-        if(/^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(route2)){
-          return route2;
-        }
-        return PROXY_BASE + TARGET_ORIGIN + route2;
-      }
-
-      if(parsedAbs.origin === location.origin && parsedAbs.pathname.indexOf('/proxy/') === 0){
-        return abs;
-      }
-    }catch(e){}
-
-    return PROXY_BASE + abs;
-  }catch(e){
+  // Relative path starting with /
+  if(u.charAt(0) === '/'){
+    if(isUnsupportedLocalPath(u)) return '#';
+    // These are pyazz paths served at our clean root
     return u;
   }
+
+  // Try to parse as absolute URL
+  try{
+    var parsed;
+    try{
+      parsed = new URL(u);
+    }catch(e){
+      parsed = new URL(u, currentTargetPage());
+    }
+
+    // pyazz origin → clean path
+    if(isPyazzOriginCheck(parsed.origin)){
+      var cleanPath = parsed.pathname + parsed.search + parsed.hash;
+      if(isUnsupportedLocalPath(cleanPath)) return '#';
+      return cleanPath;
+    }
+
+    // Same proxy origin → clean path (unless already /proxy/)
+    if(parsed.origin === location.origin){
+      if(parsed.pathname.indexOf('/proxy/') === 0) return u;
+      var selfPath = parsed.pathname + parsed.search + parsed.hash;
+      if(isUnsupportedLocalPath(selfPath)) return '#';
+      return selfPath;
+    }
+
+    // External → /proxy/ prefix
+    return PROXY_BASE + parsed.href;
+  }catch(e){}
+
+  // Fallback: resolve relative to current target page
+  try{
+    var resolved = new URL(u, currentTargetPage());
+    if(isPyazzOriginCheck(resolved.origin)){
+      return resolved.pathname + resolved.search + resolved.hash;
+    }
+    return PROXY_BASE + resolved.href;
+  }catch(e){}
+
+  return u;
 }
 
 function rewriteSrcset(v){
@@ -1159,6 +1257,7 @@ function rewriteSrcset(v){
   }
 }
 
+// ===== Hide unsupported tabs =====
 function hideUnsupportedTabs(root){
   try{
     var links = [];
@@ -1197,9 +1296,9 @@ function hideUnsupportedTabs(root){
   }catch(e){}
 }
 
+// ===== Decorate poster titles =====
 function decoratePosterTitles(root){
   try{
-    // အရင်ထည့်ထားတဲ့ title အဟောင်းတွေကိုဖျက်
     try{
       var olds = document.querySelectorAll('.__proxy_poster_title');
       for(var x=0;x<olds.length;x++){
@@ -1228,7 +1327,6 @@ function decoratePosterTitles(root){
 
       if(/logo|banner|advert|icon|avatar|profile|search/i.test(title)) continue;
 
-      // anchor အောက်မှာ label တစ်ခုပဲထည့်
       var next = a.nextElementSibling;
       if(next && next.classList && next.classList.contains('__proxy_poster_title')){
         continue;
@@ -1253,6 +1351,8 @@ function decoratePosterTitles(root){
     }
   }catch(e){}
 }
+
+// ===== Hide header brand =====
 function hideHeaderBrand(root){
   try{
     var nodes = [];
@@ -1274,6 +1374,7 @@ function hideHeaderBrand(root){
   }catch(e){}
 }
 
+// ===== Patch video elements =====
 function patchVideoElements(root){
   try{
     var vids = [];
@@ -1340,8 +1441,10 @@ function patchVideoElements(root){
   }catch(e){}
 }
 
+// ===== Initialize =====
 persistTargetOrigin();
 
+// Patch fetch
 try{
   var originalFetch = window.fetch;
   window.fetch = function(input, init){
@@ -1375,6 +1478,7 @@ try{
   };
 }catch(e){}
 
+// Patch XHR
 try{
   var originalXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url){
@@ -1401,6 +1505,7 @@ try{
   };
 }catch(e){}
 
+// Window error handlers
 window.addEventListener('error', function(e){
   try{
     reportFail('WINDOW ERROR', e.filename || '', e.message || '');
@@ -1415,18 +1520,14 @@ window.addEventListener('unhandledrejection', function(e){
   }catch(err){}
 });
 
+// Patch history (clean URLs in address bar)
 try{
   var pushState = history.pushState;
   var replaceState = history.replaceState;
 
   history.pushState = function(s,t,u){
     if(u && typeof u === 'string'){
-      var localRoute = toLocalProxyRoute(u);
-      if(localRoute){
-        u = localRoute;
-      }else if(u.indexOf(PROXY_BASE) !== 0 && u.indexOf('/proxy/http') === -1){
-        u = proxify(u);
-      }
+      u = proxify(u);
     }
     persistTargetOrigin();
     return pushState.call(this, s, t, u);
@@ -1434,18 +1535,14 @@ try{
 
   history.replaceState = function(s,t,u){
     if(u && typeof u === 'string'){
-      var localRoute = toLocalProxyRoute(u);
-      if(localRoute){
-        u = localRoute;
-      }else if(u.indexOf(PROXY_BASE) !== 0 && u.indexOf('/proxy/http') === -1){
-        u = proxify(u);
-      }
+      u = proxify(u);
     }
     persistTargetOrigin();
     return replaceState.call(this, s, t, u);
   };
 }catch(e){}
 
+// Patch window.open
 try{
   var winOpen = window.open;
   window.open = function(u,n,f){
@@ -1454,6 +1551,7 @@ try{
   };
 }catch(e){}
 
+// Patch setAttribute
 try{
   var setAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function(name, value){
@@ -1473,6 +1571,7 @@ try{
   };
 }catch(e){}
 
+// Click handler
 document.addEventListener('click', function(e){
   var el = e.target;
   var limit = 20;
@@ -1498,23 +1597,13 @@ document.addEventListener('click', function(e){
       e.stopPropagation();
       persistTargetOrigin();
 
-      var localRoute = toLocalProxyRoute(href);
-      if(localRoute){
-        location.href = localRoute;
-        return false;
-      }
-
-      if(href.indexOf(PROXY_BASE) === 0 || href.indexOf('/proxy/http') !== -1){
-        location.href = href;
-        return false;
-      }
-
       location.href = proxify(href);
       return false;
     }
   }
 }, true);
 
+// Form submit handler
 document.addEventListener('submit', function(e){
   var f = e.target;
   if(f && f.tagName === 'FORM'){
@@ -1526,6 +1615,7 @@ document.addEventListener('submit', function(e){
   }
 }, true);
 
+// DOM rewriting
 function rewriteNode(el){
   if(!el || !el.getAttribute) return;
 
@@ -1565,6 +1655,7 @@ function rewriteTree(root){
   decoratePosterTitles(root);
 }
 
+// MutationObserver
 var mo = new MutationObserver(function(muts){
   for(var i=0;i<muts.length;i++){
     var m = muts[i];
@@ -1585,15 +1676,7 @@ if(document.documentElement){
   });
 }
 
-if(document.readyState === 'loading'){
-  document.addEventListener('DOMContentLoaded', function(){
-    persistTargetOrigin();
-    hideUnsupportedTabs(document);
-    hideHeaderBrand(document);
-    patchVideoElements(document);
-    rewriteTree(document.documentElement);
-  });
-}else{
+function fullRewrite(){
   persistTargetOrigin();
   hideUnsupportedTabs(document);
   hideHeaderBrand(document);
@@ -1601,13 +1684,16 @@ if(document.readyState === 'loading'){
   rewriteTree(document.documentElement);
 }
 
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', fullRewrite);
+}else{
+  fullRewrite();
+}
+
 window.addEventListener('load', function(){
-  persistTargetOrigin();
-  hideUnsupportedTabs(document);
-  hideHeaderBrand(document);
-  patchVideoElements(document);
-  setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
-  setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
+  fullRewrite();
+  setTimeout(fullRewrite, 100);
+  setTimeout(fullRewrite, 800);
   setTimeout(function(){
     hideUnsupportedTabs(document);
     hideHeaderBrand(document);
@@ -1616,6 +1702,7 @@ window.addEventListener('load', function(){
   }, 1600);
 });
 
+// Disable service workers
 try{
   Object.defineProperty(navigator, 'serviceWorker', {
     get: function(){
@@ -1631,11 +1718,12 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz-only locked version active');
+console.log('[Proxy] Clean URL mode active');
 })();
 <\/script>`;
 }
 
+// ===== Static response helpers =====
 function corsHeaders(): Headers {
   return new Headers({
     "access-control-allow-origin": "*",
