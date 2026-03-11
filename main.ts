@@ -16,9 +16,19 @@ const ALLOWED_ENTRY_HOSTS = new Set([
   "getmeilimeilisearchv190-production-b165.up.railway.app",
 ]);
 
+// Hosts that are known to serve images for pyazz (TMDB, CDNs, etc.)
+const KNOWN_IMAGE_HOSTS = new Set([
+  "image.tmdb.org",
+  "m.media-amazon.com",
+  "images-na.ssl-images-amazon.com",
+  "i.imgur.com",
+]);
+
 // ===== Short-lived caches =====
 const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000;
 const MEDIA_RESOLVE_CACHE_TTL_MS = 3 * 1000;
+// Cache for resolved video redirect chains (longer TTL since signed URLs typically last minutes)
+const VIDEO_RESOLVE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 type DetailCacheEntry = {
   expiresAt: number;
@@ -34,6 +44,7 @@ type ResolveCacheEntry = {
 
 const detailHtmlCache = new Map<string, DetailCacheEntry>();
 const mediaResolveCache = new Map<string, ResolveCacheEntry>();
+const videoResolveCache = new Map<string, ResolveCacheEntry>();
 
 Deno.serve({ port: PORT }, handler);
 console.log(`Pyazz-only proxy running on http://localhost:${PORT}`);
@@ -91,11 +102,15 @@ async function handler(req: Request): Promise<Response> {
 
     const cookieOrigin = getCookie(req, TARGET_COOKIE) || "";
     const refererOrigin = inferOriginFromReferer(req) || "";
-    const pyazzContext = isPyazzOrigin(cookieOrigin) || isPyazzOrigin(refererOrigin);
+    const pyazzContext =
+      isPyazzOrigin(cookieOrigin) || isPyazzOrigin(refererOrigin);
 
     if (!isAllowedTarget(targetUrl, req, pyazzContext)) {
       return new Response(
-        errorPage("This proxy only supports pyazz.com resources.", targetUrl.href),
+        errorPage(
+          "This proxy only supports pyazz.com resources.",
+          targetUrl.href,
+        ),
         {
           status: 403,
           headers: htmlHeaders(),
@@ -105,8 +120,16 @@ async function handler(req: Request): Promise<Response> {
 
     const isMedia = looksLikeMediaRequest(targetUrl, req);
 
+    // --- Special handler for video stream requests (2-step redirect links) ---
+    if (isMedia && isVideoStreamRequest(targetUrl)) {
+      return await handleVideoStream(req, targetUrl, cookieOrigin || targetUrl.origin, proxyOrigin);
+    }
+
     if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
-      const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin || targetUrl.origin);
+      const cacheKey = makeDetailCacheKey(
+        targetUrl.href,
+        cookieOrigin || targetUrl.origin,
+      );
       const cached = detailHtmlCache.get(cacheKey);
 
       if (cached && cached.expiresAt > Date.now()) {
@@ -135,7 +158,10 @@ async function handler(req: Request): Promise<Response> {
     const contentType = upstream.headers.get("content-type") || "";
     const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
 
-    if (!effectiveIsMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
+    if (
+      !effectiveIsMedia &&
+      [301, 302, 303, 307, 308].includes(upstream.status)
+    ) {
       const loc = upstream.headers.get("location");
       if (loc) {
         const abs = new URL(loc, effectiveTargetUrl.href).href;
@@ -171,7 +197,11 @@ async function handler(req: Request): Promise<Response> {
       );
       outHeaders.set("x-proxy-cache", "MISS");
 
-      if (req.method === "GET" && !effectiveIsMedia && isDetailLikePage(effectiveTargetUrl)) {
+      if (
+        req.method === "GET" &&
+        !effectiveIsMedia &&
+        isDetailLikePage(effectiveTargetUrl)
+      ) {
         const cacheKey = makeDetailCacheKey(
           effectiveTargetUrl.href,
           cookieOrigin || targetUrl.origin,
@@ -192,7 +222,11 @@ async function handler(req: Request): Promise<Response> {
 
     if (contentType.includes("text/css")) {
       let css = await upstream.text();
-      css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX);
+      css = rewriteCss(
+        css,
+        effectiveTargetUrl.href,
+        proxyOrigin + PROXY_PREFIX,
+      );
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
@@ -210,9 +244,13 @@ async function handler(req: Request): Promise<Response> {
       contentType.includes("text/javascript") ||
       contentType.includes("application/x-javascript")
     ) {
-      // Rewrite JS content to fix Next.js data fetching URLs
       let jsText = await upstream.text();
-      jsText = rewriteJavaScript(jsText, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX, cookieOrigin || targetUrl.origin);
+      jsText = rewriteJavaScript(
+        jsText,
+        effectiveTargetUrl.href,
+        proxyOrigin + PROXY_PREFIX,
+        cookieOrigin || targetUrl.origin,
+      );
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
@@ -227,11 +265,17 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    if (contentType.includes("application/json") || contentType.includes("+json")) {
+    if (
+      contentType.includes("application/json") ||
+      contentType.includes("+json")
+    ) {
       let txt = await upstream.text();
-
-      // Rewrite JSON responses that contain URLs (e.g., _next/data responses, API responses)
-      txt = rewriteJsonUrls(txt, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX, cookieOrigin || targetUrl.origin);
+      txt = rewriteJsonUrls(
+        txt,
+        effectiveTargetUrl.href,
+        proxyOrigin + PROXY_PREFIX,
+        cookieOrigin || targetUrl.origin,
+      );
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
@@ -271,6 +315,265 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
+// ===== NEW: Handle video stream 2-step redirect =====
+// The video links go: original URL → 302/301 → R2 signed URL
+// Instead of just proxying headers, we follow the redirect chain server-side
+// and then stream the final content back through the proxy
+function isVideoStreamRequest(url: URL): boolean {
+  const path = url.pathname.toLowerCase();
+  const host = url.hostname.toLowerCase();
+  return (
+    path.endsWith(".mp4") ||
+    path.endsWith(".m3u8") ||
+    path.endsWith(".mkv") ||
+    path.endsWith(".webm") ||
+    path.includes("/d/") ||
+    host.includes("r2.dev") ||
+    host.includes("r2.cloudflarestorage.com") ||
+    (host.includes("railway.app") &&
+      !host.includes("pyazzindex-production") &&
+      !host.includes("getmeilimeilisearchv190-production"))
+  );
+}
+
+async function handleVideoStream(
+  req: Request,
+  targetUrl: URL,
+  cookieOrigin: string,
+  proxyOrigin: string,
+): Promise<Response> {
+  const cacheKey = `video::${targetUrl.href}`;
+
+  // Step 1: Resolve the final URL by following all redirects
+  let finalUrl: string;
+
+  const cached = videoResolveCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    finalUrl = cached.finalUrl;
+    console.log(`[VideoStream] Using cached final URL for ${targetUrl.href}`);
+  } else {
+    try {
+      finalUrl = await resolveVideoFinalUrl(targetUrl, cookieOrigin);
+      videoResolveCache.set(cacheKey, {
+        expiresAt: Date.now() + VIDEO_RESOLVE_CACHE_TTL_MS,
+        finalUrl,
+      });
+      console.log(`[VideoStream] Resolved ${targetUrl.href} -> ${finalUrl}`);
+    } catch (err) {
+      console.error(`[VideoStream] Failed to resolve: ${err}`);
+      finalUrl = targetUrl.href;
+    }
+  }
+
+  // Step 2: Fetch the actual content from the final URL and stream it back
+  const finalUrlObj = new URL(finalUrl);
+  const streamHeaders = new Headers();
+
+  streamHeaders.set(
+    "user-agent",
+    req.headers.get("user-agent") ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  );
+  streamHeaders.set("accept", req.headers.get("accept") || "*/*");
+  streamHeaders.set("accept-encoding", "identity");
+
+  // Pass through Range header for partial content requests (seeking in video)
+  const rangeHeader = req.headers.get("range");
+  if (rangeHeader) {
+    streamHeaders.set("range", rangeHeader);
+  }
+
+  // For R2 signed URLs, set the referer to the R2 host itself
+  // (R2 URLs don't typically check referer, but just in case)
+  if (
+    finalUrlObj.hostname.includes("r2.dev") ||
+    finalUrlObj.hostname.includes("r2.cloudflarestorage.com")
+  ) {
+    streamHeaders.set("referer", finalUrlObj.origin + "/");
+  } else {
+    const refBase = /^https?:\/\//i.test(cookieOrigin)
+      ? cookieOrigin
+      : targetUrl.origin;
+    streamHeaders.set("referer", refBase + "/");
+    streamHeaders.set("origin", refBase);
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(finalUrl, {
+      method: req.method,
+      headers: streamHeaders,
+      redirect: "follow",
+    });
+  } catch (fetchErr) {
+    // If cached URL fails, try resolving fresh
+    if (cached) {
+      videoResolveCache.delete(cacheKey);
+      try {
+        finalUrl = await resolveVideoFinalUrl(targetUrl, cookieOrigin);
+        videoResolveCache.set(cacheKey, {
+          expiresAt: Date.now() + VIDEO_RESOLVE_CACHE_TTL_MS,
+          finalUrl,
+        });
+
+        // For R2 signed URLs, update referer
+        const freshUrlObj = new URL(finalUrl);
+        if (
+          freshUrlObj.hostname.includes("r2.dev") ||
+          freshUrlObj.hostname.includes("r2.cloudflarestorage.com")
+        ) {
+          streamHeaders.set("referer", freshUrlObj.origin + "/");
+          streamHeaders.delete("origin");
+        }
+
+        upstream = await fetch(finalUrl, {
+          method: req.method,
+          headers: streamHeaders,
+          redirect: "follow",
+        });
+      } catch (retryErr) {
+        console.error(`[VideoStream] Retry also failed: ${retryErr}`);
+        return new Response("Video stream unavailable", {
+          status: 502,
+          headers: textHeaders(),
+        });
+      }
+    } else {
+      console.error(`[VideoStream] Fetch failed: ${fetchErr}`);
+      return new Response("Video stream unavailable", {
+        status: 502,
+        headers: textHeaders(),
+      });
+    }
+  }
+
+  // If the resolved URL also returns a redirect, follow it again
+  if ([301, 302, 303, 307, 308].includes(upstream.status)) {
+    const loc = upstream.headers.get("location");
+    if (loc) {
+      const absLoc = new URL(loc, finalUrl).href;
+      videoResolveCache.set(cacheKey, {
+        expiresAt: Date.now() + VIDEO_RESOLVE_CACHE_TTL_MS,
+        finalUrl: absLoc,
+      });
+
+      const retryHeaders = new Headers(streamHeaders);
+      const retryUrlObj = new URL(absLoc);
+      if (
+        retryUrlObj.hostname.includes("r2.dev") ||
+        retryUrlObj.hostname.includes("r2.cloudflarestorage.com")
+      ) {
+        retryHeaders.set("referer", retryUrlObj.origin + "/");
+        retryHeaders.delete("origin");
+      }
+
+      upstream = await fetch(absLoc, {
+        method: req.method,
+        headers: retryHeaders,
+        redirect: "follow",
+      });
+    }
+  }
+
+  // If still failing, clear cache for next try
+  if (!upstream.ok && upstream.status !== 206) {
+    videoResolveCache.delete(cacheKey);
+    console.warn(
+      `[VideoStream] Final fetch returned ${upstream.status} for ${finalUrl}`,
+    );
+  }
+
+  // Build response headers
+  const outHeaders = new Headers();
+  const copyHeaders = [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "content-disposition",
+    "cache-control",
+    "etag",
+    "last-modified",
+  ];
+  for (const key of copyHeaders) {
+    const val = upstream.headers.get(key);
+    if (val) outHeaders.set(key, val);
+  }
+
+  // CORS headers
+  outHeaders.set("access-control-allow-origin", "*");
+  outHeaders.set(
+    "access-control-allow-methods",
+    "GET, POST, OPTIONS, HEAD",
+  );
+  outHeaders.set("access-control-allow-headers", "*");
+  outHeaders.set("access-control-expose-headers", "*");
+
+  // Remove restrictive headers
+  outHeaders.delete("content-security-policy");
+  outHeaders.delete("x-frame-options");
+  outHeaders.delete("strict-transport-security");
+  outHeaders.delete("cross-origin-opener-policy");
+  outHeaders.delete("cross-origin-resource-policy");
+  outHeaders.delete("cross-origin-embedder-policy");
+
+  outHeaders.append(
+    "set-cookie",
+    `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+  );
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: outHeaders,
+  });
+}
+
+async function resolveVideoFinalUrl(
+  targetUrl: URL,
+  cookieOrigin: string,
+): Promise<string> {
+  // Follow redirect chain manually to get the final signed URL
+  let currentUrl = targetUrl.href;
+  const maxRedirects = 10;
+
+  for (let i = 0; i < maxRedirects; i++) {
+    const currentUrlObj = new URL(currentUrl);
+    const headers = new Headers();
+    headers.set(
+      "user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    );
+    headers.set("accept", "*/*");
+    headers.set("accept-encoding", "identity");
+
+    const refBase = /^https?:\/\//i.test(cookieOrigin)
+      ? cookieOrigin
+      : targetUrl.origin;
+    headers.set("referer", refBase + "/");
+    headers.set("origin", refBase);
+
+    const resp = await fetch(currentUrl, {
+      method: "HEAD",
+      headers,
+      redirect: "manual",
+    });
+
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const loc = resp.headers.get("location");
+      if (loc) {
+        currentUrl = new URL(loc, currentUrl).href;
+        console.log(`[VideoResolve] Redirect ${i + 1}: ${currentUrl}`);
+        continue;
+      }
+    }
+
+    // Not a redirect, this is the final URL
+    break;
+  }
+
+  return currentUrl;
+}
+
 async function fetchUpstreamWithRetry(
   req: Request,
   originalTargetUrl: URL,
@@ -278,7 +581,8 @@ async function fetchUpstreamWithRetry(
 ): Promise<{ upstream: Response; effectiveTargetUrl: URL }> {
   const isMedia = looksLikeMediaRequest(originalTargetUrl, req);
   const resolveKey = makeResolveCacheKey(originalTargetUrl.href, cookieOrigin);
-  const bypassResolvedCache = shouldBypassResolvedMediaCache(originalTargetUrl);
+  const bypassResolvedCache =
+    shouldBypassResolvedMediaCache(originalTargetUrl);
 
   let effectiveTargetUrl = originalTargetUrl;
   let usedCachedResolve = false;
@@ -300,13 +604,21 @@ async function fetchUpstreamWithRetry(
   try {
     let upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
 
-    if (isMedia && usedCachedResolve && shouldRetryMediaStatus(upstream.status)) {
+    if (
+      isMedia &&
+      usedCachedResolve &&
+      shouldRetryMediaStatus(upstream.status)
+    ) {
       mediaResolveCache.delete(resolveKey);
       effectiveTargetUrl = originalTargetUrl;
       upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
     }
 
-    if (isMedia && !usedCachedResolve && shouldRetryMediaStatus(upstream.status)) {
+    if (
+      isMedia &&
+      !usedCachedResolve &&
+      shouldRetryMediaStatus(upstream.status)
+    ) {
       mediaResolveCache.delete(resolveKey);
       effectiveTargetUrl = originalTargetUrl;
       upstream = await doFetch(req, effectiveTargetUrl, cookieOrigin);
@@ -344,8 +656,7 @@ function shouldBypassResolvedMediaCache(url: URL): boolean {
   const p = url.pathname.toLowerCase();
 
   return (
-    h.includes("pyazzindex-production.up.railway.app") ||
-    p.includes("/d/")
+    h.includes("pyazzindex-production.up.railway.app") || p.includes("/d/")
   );
 }
 
@@ -385,6 +696,14 @@ function isTempMediaHost(hostname: string): boolean {
   return h.endsWith(".r2.dev") || h.endsWith(".r2.cloudflarestorage.com");
 }
 
+function isKnownImageHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  for (const known of KNOWN_IMAGE_HOSTS) {
+    if (h === known || h.endsWith("." + known)) return true;
+  }
+  return false;
+}
+
 function isTopLevelDocumentRequest(req: Request): boolean {
   const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
   const mode = (req.headers.get("sec-fetch-mode") || "").toLowerCase();
@@ -393,7 +712,10 @@ function isTopLevelDocumentRequest(req: Request): boolean {
 
 function isMeilisearchApiRequest(url: URL): boolean {
   const h = url.hostname.toLowerCase();
-  return h.includes("getmeilimeilisearchv190-production") && h.endsWith(".railway.app");
+  return (
+    h.includes("getmeilimeilisearchv190-production") &&
+    h.endsWith(".railway.app")
+  );
 }
 
 function isAllowedTarget(
@@ -406,6 +728,11 @@ function isAllowedTarget(
   if (ALLOWED_ENTRY_HOSTS.has(host)) return true;
 
   if (pyazzContext && looksLikeMediaRequest(targetUrl, req) && isTempMediaHost(host)) {
+    return true;
+  }
+
+  // Allow known image CDN hosts in pyazz context (TMDB posters, etc.)
+  if (pyazzContext && isKnownImageHost(host)) {
     return true;
   }
 
@@ -428,6 +755,10 @@ function cleanupCaches() {
 
   for (const [k, v] of mediaResolveCache.entries()) {
     if (v.expiresAt <= now) mediaResolveCache.delete(k);
+  }
+
+  for (const [k, v] of videoResolveCache.entries()) {
+    if (v.expiresAt <= now) videoResolveCache.delete(k);
   }
 }
 
@@ -479,9 +810,7 @@ function extractTargetUrl(req: Request, url: URL): string {
 
 function inferOriginFromReferer(req: Request): string {
   const referer =
-    req.headers.get("referer") ||
-    req.headers.get("referrer") ||
-    "";
+    req.headers.get("referer") || req.headers.get("referrer") || "";
 
   if (!referer) return "";
 
@@ -591,7 +920,11 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
   const host = url.hostname.toLowerCase();
   const accept = (req.headers.get("accept") || "").toLowerCase();
 
-  if (host.includes("pyazzindex-production") && host.endsWith(".railway.app")) return false;
+  if (
+    host.includes("pyazzindex-production") &&
+    host.endsWith(".railway.app")
+  )
+    return false;
 
   // Next.js data routes are NOT media
   if (path.startsWith("/_next/")) return false;
@@ -605,7 +938,9 @@ function looksLikeMediaRequest(url: URL, req: Request): boolean {
     path.includes("/d/") ||
     host.includes("r2.dev") ||
     host.includes("r2.cloudflarestorage.com") ||
-    (host.includes("railway.app") && !host.includes("pyazzindex-production") && !host.includes("getmeilimeilisearchv190-production")) ||
+    (host.includes("railway.app") &&
+      !host.includes("pyazzindex-production") &&
+      !host.includes("getmeilimeilisearchv190-production")) ||
     accept.includes("video/") ||
     accept.includes("application/octet-stream")
   );
@@ -733,7 +1068,7 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   return h;
 }
 
-// NEW: Rewrite JavaScript to fix hardcoded origin URLs
+// Rewrite JavaScript to fix hardcoded origin URLs and Next.js image loader
 function rewriteJavaScript(
   js: string,
   baseUrl: string,
@@ -742,22 +1077,54 @@ function rewriteJavaScript(
 ): string {
   // Replace hardcoded pyazz.com origins in JS bundles
   for (const origin of PYAZZ_ORIGINS) {
-    // Replace "https://pyazz.com" and 'https://pyazz.com' in JS
     js = js.replaceAll(`"${origin}"`, `"${proxyBase}${origin}"`);
     js = js.replaceAll(`'${origin}'`, `'${proxyBase}${origin}'`);
   }
+
+  // Fix Next.js image loader - rewrite /_next/image URLs to go through proxy
+  // Next.js generates code like: src="/_next/image?url=..."
+  // We need these to go through: /proxy/https://pyazz.com/_next/image?url=...
+  js = js.replaceAll(
+    '"/_next/image',
+    `"${proxyBase}${targetOrigin}/_next/image`,
+  );
+  js = js.replaceAll(
+    "'/_next/image",
+    `'${proxyBase}${targetOrigin}/_next/image`,
+  );
+
+  // Also rewrite relative /_next/data/ paths for client-side data fetching
+  // Match patterns like "/_next/data/BUILD_ID/
+  js = js.replace(
+    /(['"])(\/_next\/data\/[^'"]+)(['"])/g,
+    (_m, q1, path, q2) => {
+      return `${q1}${proxyBase}${targetOrigin}${path}${q2}`;
+    },
+  );
+
   return js;
 }
 
-// NEW: Rewrite JSON responses that may contain URLs
+// Rewrite JSON responses that may contain URLs
 function rewriteJsonUrls(
   json: string,
   _baseUrl: string,
-  _proxyBase: string,
-  _targetOrigin: string,
+  proxyBase: string,
+  targetOrigin: string,
 ): string {
-  // Don't aggressively rewrite JSON - just return as-is
-  // The client-side fetch interceptor handles URL rewriting
+  // Rewrite image URLs in JSON (e.g., poster paths from TMDB in API responses)
+  // Match "https://image.tmdb.org/..." and similar image CDN URLs
+  try {
+    // Rewrite absolute URLs pointing to pyazz origin
+    for (const origin of PYAZZ_ORIGINS) {
+      // In JSON strings, URLs may be escaped
+      const escaped = origin.replace(/\//g, "\\/");
+      json = json.replaceAll(escaped, proxyBase.replace(/\//g, "\\/") + origin.replace(/\//g, "\\/"));
+      json = json.replaceAll(`"${origin}`, `"${proxyBase}${origin}`);
+    }
+  } catch {
+    // Don't break on JSON rewrite errors
+  }
   return json;
 }
 
@@ -776,9 +1143,50 @@ function rewriteHtml(
     "",
   );
 
+  // ===== FIX 1: Rewrite Next.js Image component src attributes =====
+  // Next.js Image component generates src like: /_next/image?url=<encoded>&w=640&q=75
+  // We need to proxy these through: /proxy/https://pyazz.com/_next/image?url=<encoded>&w=640&q=75
+  html = html.replace(
+    /(src\s*=\s*["'])(\/\_next\/image\?[^"']*)(["'])/gi,
+    (_m, prefix, path, quote) => {
+      return `${prefix}${proxyBase}${targetOrigin}${path}${quote}`;
+    },
+  );
+
+  // Also rewrite srcSet for Next.js Image (responsive images)
+  html = html.replace(
+    /(srcSet\s*=\s*["'])([^"']*\/_next\/image[^"']*)(["'])/gi,
+    (_m, prefix, val, quote) => {
+      const parts = val.split(",").map((p: string) => {
+        const t = p.trim();
+        if (!t) return t;
+        const i = t.search(/\s/);
+        const url = i === -1 ? t : t.slice(0, i);
+        const desc = i === -1 ? "" : t.slice(i);
+        if (url.startsWith("/_next/image")) {
+          return `${proxyBase}${targetOrigin}${url}${desc}`;
+        }
+        return t;
+      });
+      return `${prefix}${parts.join(", ")}${quote}`;
+    },
+  );
+
+  // Rewrite data-src and data-srcset attributes (lazy loading)
+  html = html.replace(
+    /(data-src\s*=\s*["'])(\/\_next\/image\?[^"']*)(["'])/gi,
+    (_m, prefix, path, quote) => {
+      return `${prefix}${proxyBase}${targetOrigin}${path}${quote}`;
+    },
+  );
+
   html = html.replace(
     /((?:href|src|action|poster)\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, value) => {
+      // Skip if already rewritten above (/_next/image)
+      if (value.includes(proxyBase)) {
+        return `${prefix}${quote}${value}${quote}`;
+      }
       if (!shouldProxy(value) || isAlreadyProxied(value, proxyBase)) {
         return `${prefix}${quote}${value}${quote}`;
       }
@@ -792,6 +1200,10 @@ function rewriteHtml(
   html = html.replace(
     /(srcset\s*=\s*)(["'])([^"']*?)\2/gi,
     (_m, prefix, quote, val) => {
+      // Skip if already contains proxy base
+      if (val.includes(proxyBase)) {
+        return `${prefix}${quote}${val}${quote}`;
+      }
       const parts = val.split(",").map((p: string) => {
         const t = p.trim();
         if (!t) return t;
@@ -824,12 +1236,18 @@ function rewriteHtml(
     },
   );
 
-  // Rewrite __NEXT_DATA__ script if present
+  // ===== FIX 2: Rewrite __NEXT_DATA__ script to fix image URLs and page props =====
   html = html.replace(
     /(<script\s+id\s*=\s*["']__NEXT_DATA__["'][^>]*>)([\s\S]*?)(<\/script>)/gi,
     (_m, open, content, close) => {
-      // Don't rewrite Next data - let client handle it
-      return open + content + close;
+      try {
+        // Parse the JSON and rewrite image URLs inside
+        const data = JSON.parse(content);
+        rewriteNextDataImages(data, proxyBase, targetOrigin);
+        return open + JSON.stringify(data) + close;
+      } catch {
+        return open + content + close;
+      }
     },
   );
 
@@ -844,6 +1262,76 @@ function rewriteHtml(
   }
 
   return html;
+}
+
+// Recursively walk __NEXT_DATA__ and rewrite image URLs
+function rewriteNextDataImages(
+  obj: any,
+  proxyBase: string,
+  targetOrigin: string,
+): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      if (typeof obj[i] === "string") {
+        obj[i] = rewriteNextDataString(obj[i], proxyBase, targetOrigin);
+      } else {
+        rewriteNextDataImages(obj[i], proxyBase, targetOrigin);
+      }
+    }
+    return;
+  }
+
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (typeof val === "string") {
+      // Rewrite image/poster URL strings
+      if (
+        key === "poster" ||
+        key === "image" ||
+        key === "thumbnail" ||
+        key === "backdrop" ||
+        key === "cover" ||
+        key === "poster_path" ||
+        key === "backdrop_path" ||
+        key === "img" ||
+        key === "src" ||
+        key === "url" ||
+        key === "photo"
+      ) {
+        if (val.startsWith("http") && !val.includes(proxyBase)) {
+          obj[key] = proxyBase + val;
+        } else if (val.startsWith("/") && !val.startsWith("//") && !val.startsWith("/proxy/")) {
+          // Relative URL like /some/image/path - proxy through target origin
+          obj[key] = proxyBase + targetOrigin + val;
+        }
+      }
+      // Rewrite any string that looks like an absolute image URL
+      else if (
+        /^https?:\/\/.+\.(jpg|jpeg|png|webp|gif|avif|svg)/i.test(val) &&
+        !val.includes(proxyBase)
+      ) {
+        obj[key] = proxyBase + val;
+      }
+    } else {
+      rewriteNextDataImages(val, proxyBase, targetOrigin);
+    }
+  }
+}
+
+function rewriteNextDataString(
+  val: string,
+  proxyBase: string,
+  targetOrigin: string,
+): string {
+  if (
+    /^https?:\/\/.+\.(jpg|jpeg|png|webp|gif|avif|svg)/i.test(val) &&
+    !val.includes(proxyBase)
+  ) {
+    return proxyBase + val;
+  }
+  return val;
 }
 
 function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
@@ -869,7 +1357,11 @@ function rewriteCss(css: string, baseUrl: string, proxyBase: string): string {
   return css;
 }
 
-function rewriteCssUrls(css: string, baseUrl: string, proxyBase: string): string {
+function rewriteCssUrls(
+  css: string,
+  baseUrl: string,
+  proxyBase: string,
+): string {
   return css.replace(
     /url\s*\(\s*["']?([^"')]+?)["']?\s*\)/gi,
     (_m, link) => {
@@ -884,7 +1376,9 @@ function rewriteCssUrls(css: string, baseUrl: string, proxyBase: string): string
 
 function shouldProxy(value: string): boolean {
   if (!value) return false;
-  return !/^(javascript:|data:|blob:|#|about:|mailto:|tel:)/i.test(value.trim());
+  return !/^(javascript:|data:|blob:|#|about:|mailto:|tel:)/i.test(
+    value.trim(),
+  );
 }
 
 function isAlreadyProxied(value: string, proxyBase: string): boolean {
@@ -921,22 +1415,6 @@ function isUnsupportedLocalPath(path){
   return false;
 }
 
-function shouldIgnoreDebugUrl(url){
-  try{
-    var s = String(url || '');
-    if(/google-analytics\\.com|googletagmanager\\.com/i.test(s)) return true;
-    var p1 = location.origin + '/proxy/https://' + location.host + '/';
-    var p2 = location.origin + '/proxy/http://' + location.host + '/';
-    var p3 = location.origin + '/proxy/' + location.origin + '/';
-    if(s.indexOf(p1) === 0) return true;
-    if(s.indexOf(p2) === 0) return true;
-    if(s.indexOf(p3) === 0) return true;
-    return false;
-  }catch(e){
-    return false;
-  }
-}
-
 var PROXY_BASE = ${JSON.stringify(proxyBase)};
 var TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
 var CURRENT_PAGE = ${JSON.stringify(currentPageUrl)};
@@ -960,18 +1438,16 @@ function currentTargetPage(){
   return CURRENT_PAGE;
 }
 
-// Detect Next.js internal routes like /_next/data/xxx/...
 function isNextDataRoute(u){
   if(!u || typeof u !== 'string') return false;
   return /^\\/_next\\//i.test(u.trim()) || /\\/_next\\/data\\//i.test(u);
 }
 
-function isAppRoute(u){
+function isNextImageRoute(u){
   if(!u || typeof u !== 'string') return false;
-  return /^\\/video\\/[a-z0-9-]+(?:[/?#].*)?$/i.test(u.trim());
+  return /^\\/_next\\/image/i.test(u.trim()) || /\\/_next\\/image\\?/i.test(u);
 }
 
-// Check if this is a pyazz.com page path (not just /video/ but also /latest, /movies, /search, etc.)
 function isPyazzPagePath(path){
   if(!path || typeof path !== 'string') return false;
   var p = path.trim().toLowerCase();
@@ -984,7 +1460,6 @@ function isPyazzPagePath(path){
   if(/^\\/genre\\//i.test(p)) return true;
   if(/^\\/country\\//i.test(p)) return true;
   if(/^\\/year\\//i.test(p)) return true;
-  // Pagination patterns like /movies?page=2 or /latest?page=2
   return false;
 }
 
@@ -1018,43 +1493,11 @@ function unwrapSelfProxyUrl(u){
       if(s.indexOf(forms[i]) === 0){
         var tail = s.substring(forms[i].length);
         if(!tail.startsWith('/')) tail = '/' + tail;
-
         if(isUnsupportedLocalPath(tail)) return '#';
-
-        if(isPyazzPagePath(tail) || isAppRoute(tail)){
-          return PROXY_BASE + TARGET_ORIGIN + tail;
-        }
-
         return PROXY_BASE + TARGET_ORIGIN + tail;
       }
     }
   }catch(e){}
-  return null;
-}
-
-function toProxyUrl(u){
-  try{
-    if(typeof u !== 'string') return u;
-
-    // Handle Next.js internal routes - always proxy through target origin
-    if(isNextDataRoute(u)){
-      return PROXY_BASE + TARGET_ORIGIN + u;
-    }
-
-    var parsed = new URL(u, currentTargetPage());
-    var route = parsed.pathname + parsed.search + parsed.hash;
-
-    // If it's a pyazz.com page route, use full proxy URL (not local route)
-    // This ensures proper server-side rendering for each page
-    if(parsed.origin === TARGET_ORIGIN && isPyazzPagePath(parsed.pathname)){
-      return PROXY_BASE + parsed.href;
-    }
-
-    if(parsed.origin === TARGET_ORIGIN){
-      return PROXY_BASE + parsed.href;
-    }
-  }catch(e){}
-
   return null;
 }
 
@@ -1072,8 +1515,8 @@ function proxify(u){
   if(u.indexOf(PROXY_BASE) === 0) return u;
   if(u.indexOf('/proxy/http') !== -1) return u;
 
-  // Handle Next.js internal routes
-  if(isNextDataRoute(u)){
+  // Handle Next.js internal routes (image optimization, data fetching)
+  if(isNextImageRoute(u) || isNextDataRoute(u)){
     return PROXY_BASE + TARGET_ORIGIN + u;
   }
 
@@ -1246,13 +1689,11 @@ function patchVideoElements(root){
           }catch(ex){}
         });
 
-        // Ensure video src is proxied
         var currentSrc = video.getAttribute('src');
         if(currentSrc && currentSrc.indexOf('/proxy/') === -1 && /^https?:\\/\\//i.test(currentSrc)){
           video.setAttribute('src', proxify(currentSrc));
         }
 
-        // Also check source elements
         var sources = video.querySelectorAll('source');
         for(var s = 0; s < sources.length; s++){
           var srcAttr = sources[s].getAttribute('src');
@@ -1283,12 +1724,90 @@ function patchVideoElements(root){
   }catch(e){}
 }
 
+// ===== FIX 3: Patch Next.js Image component =====
+// Override the Next.js image loader to always go through proxy
+function patchNextImages(root){
+  try{
+    var imgs = (root && root.querySelectorAll ? root : document).querySelectorAll('img');
+    for(var i = 0; i < imgs.length; i++){
+      var img = imgs[i];
+      if(img.getAttribute('data-proxy-img-fixed') === '1') continue;
+
+      // Fix src
+      var src = img.getAttribute('src') || '';
+      if(src && src.indexOf('/proxy/') === -1){
+        // Handle /_next/image?url=... format
+        if(src.indexOf('/_next/image') === 0){
+          img.setAttribute('src', PROXY_BASE + TARGET_ORIGIN + src);
+          img.setAttribute('data-proxy-img-fixed', '1');
+        }
+        // Handle absolute URLs to image CDNs
+        else if(/^https?:\\/\\//i.test(src) && !src.startsWith(location.origin)){
+          img.setAttribute('src', PROXY_BASE + src);
+          img.setAttribute('data-proxy-img-fixed', '1');
+        }
+      }
+
+      // Fix srcset
+      var srcset = img.getAttribute('srcset') || '';
+      if(srcset && srcset.indexOf('/proxy/') === -1 && srcset.indexOf('/_next/image') !== -1){
+        img.setAttribute('srcset', rewriteSrcset(srcset));
+        img.setAttribute('data-proxy-img-fixed', '1');
+      }
+
+      // Handle lazy loading - fix data-src and loading="lazy" images
+      var dataSrc = img.getAttribute('data-src') || '';
+      if(dataSrc && dataSrc.indexOf('/proxy/') === -1){
+        if(dataSrc.indexOf('/_next/image') === 0){
+          img.setAttribute('data-src', PROXY_BASE + TARGET_ORIGIN + dataSrc);
+        } else if(/^https?:\\/\\//i.test(dataSrc)){
+          img.setAttribute('data-src', PROXY_BASE + dataSrc);
+        }
+      }
+
+      // If image failed to load, retry with proxied URL
+      if(img.complete && img.naturalWidth === 0 && src){
+        var proxiedSrc = proxify(src);
+        if(proxiedSrc !== src){
+          img.setAttribute('src', proxiedSrc);
+          img.setAttribute('data-proxy-img-fixed', '1');
+        }
+      }
+    }
+  }catch(e){}
+}
+
+// ===== FIX 4: Monitor for broken images and fix them =====
+function fixBrokenImages(){
+  try{
+    var imgs = document.querySelectorAll('img');
+    for(var i = 0; i < imgs.length; i++){
+      var img = imgs[i];
+      if(img.getAttribute('data-proxy-retry') === '1') continue;
+      if(!img.complete || img.naturalWidth > 0) continue;
+
+      var src = img.getAttribute('src') || '';
+      if(!src) continue;
+
+      // Try to fix the broken image
+      var proxiedSrc = '';
+      if(src.indexOf('/_next/image') === 0 && src.indexOf('/proxy/') === -1){
+        proxiedSrc = PROXY_BASE + TARGET_ORIGIN + src;
+      } else if(/^https?:\\/\\//i.test(src) && src.indexOf('/proxy/') === -1){
+        proxiedSrc = PROXY_BASE + src;
+      }
+
+      if(proxiedSrc && proxiedSrc !== src){
+        img.setAttribute('data-proxy-retry', '1');
+        img.setAttribute('src', proxiedSrc);
+      }
+    }
+  }catch(e){}
+}
+
 persistTargetOrigin();
 
-// ===== CRITICAL FIX: Intercept Next.js client-side navigation =====
-// Next.js SPA uses client-side routing that fetches JSON data from /_next/data/...
-// We need to ensure these requests go through the proxy AND that page transitions work
-
+// ===== Intercept fetch for Next.js client-side data =====
 try{
   var originalFetch = window.fetch;
   window.fetch = function(input, init){
@@ -1324,31 +1843,20 @@ try{
       finalUrl = proxify(url);
       arguments[1] = finalUrl;
     }
-
     persistTargetOrigin();
     return originalXhrOpen.apply(this, arguments);
   };
 }catch(e){}
 
-// ===== CRITICAL FIX: Force full page navigation for SPA route changes =====
-// Instead of letting Next.js do client-side routing (which breaks in proxy),
-// we intercept pushState/replaceState to force full page loads for page transitions
-
+// ===== Handle SPA navigation =====
 try{
   var pushState = history.pushState;
   var replaceState = history.replaceState;
-  var lastPushUrl = '';
 
   history.pushState = function(s,t,u){
     if(u && typeof u === 'string'){
-      var newUrl = u;
-
-      // If this is a pyazz page path change (not just hash change), force full navigation
       try{
-        var currentPath = location.pathname;
-        var newPath = newUrl;
-
-        // Extract path from proxy URL if needed
+        var newPath = u;
         var proxyIdx = newPath.indexOf('/proxy/');
         if(proxyIdx !== -1){
           try{
@@ -1358,28 +1866,20 @@ try{
           }catch(e){}
         }
 
-        // If the path is actually changing (not just query params on same page)
-        // and it's a pyazz page, force full navigation
-        if(isPyazzPagePath(newPath) && currentPath !== newPath){
+        // For pyazz page navigation, force full page load through proxy
+        if(isPyazzPagePath(newPath)){
           var fullUrl = proxify(u);
           if(fullUrl && fullUrl !== '#' && fullUrl !== u){
-            // Let pushState happen normally but then navigate
-            lastPushUrl = fullUrl;
             persistTargetOrigin();
-            // Use setTimeout to let the current JS finish, then navigate
+            // Force full page navigation instead of SPA
             setTimeout(function(){
-              if(lastPushUrl){
-                var navUrl = lastPushUrl;
-                lastPushUrl = '';
-                location.href = navUrl;
-              }
-            }, 50);
-            return pushState.call(this, s, t, u);
+              location.href = fullUrl;
+            }, 10);
+            return;
           }
         }
       }catch(e){}
 
-      // For non-page-change pushState, just proxify the URL
       u = proxify(u);
     }
     persistTargetOrigin();
@@ -1395,16 +1895,12 @@ try{
   };
 }catch(e){}
 
-// ===== Handle popstate (browser back/forward) =====
 window.addEventListener('popstate', function(e){
-  // On back/forward, force a full reload to get proper server-rendered content
   try{
     var path = location.pathname;
     if(path.indexOf('/proxy/') === 0){
-      // Already a proxy URL, just reload
       location.reload();
     } else if(isPyazzPagePath(path)){
-      // Navigate to the proxy version
       location.href = PROXY_BASE + TARGET_ORIGIN + path + location.search + location.hash;
     }
   }catch(ex){
@@ -1465,7 +1961,6 @@ document.addEventListener('click', function(e){
       e.stopPropagation();
       persistTargetOrigin();
 
-      // Always force full page navigation through proxy
       var finalUrl = proxify(href);
       if(finalUrl && finalUrl !== '#'){
         location.href = finalUrl;
@@ -1500,7 +1995,7 @@ function rewriteNode(el){
 
   try{
     var ss = el.getAttribute('srcset');
-    if(ss) el.setAttribute('srcset', rewriteSrcset(ss));
+    if(ss && ss.indexOf('/proxy/') === -1) el.setAttribute('srcset', rewriteSrcset(ss));
   }catch(e){}
 }
 
@@ -1509,6 +2004,7 @@ function rewriteTree(root){
 
   hideUnsupportedTabs(root);
   patchVideoElements(root);
+  patchNextImages(root);
   showMovieTitles(root);
 
   rewriteNode(root);
@@ -1521,6 +2017,7 @@ function rewriteTree(root){
 
   hideUnsupportedTabs(root);
   patchVideoElements(root);
+  patchNextImages(root);
   showMovieTitles(root);
 }
 
@@ -1549,26 +2046,75 @@ if(document.readyState === 'loading'){
     persistTargetOrigin();
     hideUnsupportedTabs(document);
     patchVideoElements(document);
+    patchNextImages(document);
     showMovieTitles(document);
     rewriteTree(document.documentElement);
+    // Delayed fix for images that load after initial render
+    setTimeout(fixBrokenImages, 500);
+    setTimeout(fixBrokenImages, 1500);
+    setTimeout(fixBrokenImages, 3000);
   });
 }else{
   persistTargetOrigin();
   hideUnsupportedTabs(document);
   patchVideoElements(document);
+  patchNextImages(document);
   showMovieTitles(document);
   rewriteTree(document.documentElement);
+  setTimeout(fixBrokenImages, 500);
+  setTimeout(fixBrokenImages, 1500);
+  setTimeout(fixBrokenImages, 3000);
 }
 
 window.addEventListener('load', function(){
   persistTargetOrigin();
   hideUnsupportedTabs(document);
   patchVideoElements(document);
+  patchNextImages(document);
   showMovieTitles(document);
-  setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
-  setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
-  setTimeout(function(){ hideUnsupportedTabs(document); patchVideoElements(document); showMovieTitles(document); }, 1600);
+  rewriteTree(document.documentElement);
+  setTimeout(function(){
+    rewriteTree(document.documentElement);
+    fixBrokenImages();
+  }, 100);
+  setTimeout(function(){
+    rewriteTree(document.documentElement);
+    fixBrokenImages();
+  }, 800);
+  setTimeout(function(){
+    hideUnsupportedTabs(document);
+    patchVideoElements(document);
+    patchNextImages(document);
+    showMovieTitles(document);
+    fixBrokenImages();
+  }, 1600);
+  // Periodic check for broken images (handles lazy-loaded images)
+  setTimeout(fixBrokenImages, 3000);
+  setTimeout(fixBrokenImages, 5000);
 });
+
+// Also add error listener on all images to auto-fix
+document.addEventListener('error', function(e){
+  if(e.target && e.target.tagName === 'IMG'){
+    var img = e.target;
+    if(img.getAttribute('data-proxy-retry') === '1') return;
+
+    var src = img.getAttribute('src') || '';
+    if(!src) return;
+
+    var proxiedSrc = '';
+    if(src.indexOf('/_next/image') === 0 && src.indexOf('/proxy/') === -1){
+      proxiedSrc = PROXY_BASE + TARGET_ORIGIN + src;
+    } else if(/^https?:\\/\\//i.test(src) && src.indexOf('/proxy/') === -1){
+      proxiedSrc = PROXY_BASE + src;
+    }
+
+    if(proxiedSrc && proxiedSrc !== src){
+      img.setAttribute('data-proxy-retry', '1');
+      img.setAttribute('src', proxiedSrc);
+    }
+  }
+}, true);
 
 try{
   Object.defineProperty(navigator, 'serviceWorker', {
@@ -1585,7 +2131,7 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz-only locked version active (v2 - SPA nav fix)');
+console.log('[Proxy] pyazz-only proxy v3 - image fix + video stream fix + latest fix');
 })();
 <\/script>`;
 }
@@ -1593,7 +2139,8 @@ console.log('[Proxy] pyazz-only locked version active (v2 - SPA nav fix)');
 function corsHeaders(): Headers {
   return new Headers({
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
+    "access-control-allow-methods":
+      "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
     "access-control-allow-headers": "*",
     "access-control-expose-headers": "*",
     "access-control-max-age": "86400",
