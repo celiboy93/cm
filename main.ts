@@ -13,11 +13,12 @@ const ALLOWED_ENTRY_HOSTS = new Set([
   "pyazz.com",
   "www.pyazz.com",
   "pyazzindex-production.up.railway.app",
+  "getmeilimeilisearchv190-production-b165.up.railway.app",
 ]);
 
 // ===== Short-lived caches =====
-const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
-const MEDIA_RESOLVE_CACHE_TTL_MS = 15 * 1000; // 15 seconds
+const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000;
+const MEDIA_RESOLVE_CACHE_TTL_MS = 15 * 1000;
 
 type DetailCacheEntry = {
   expiresAt: number;
@@ -260,8 +261,6 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
-// ================= Fetch with media retry =================
-
 async function fetchUpstreamWithRetry(
   req: Request,
   originalTargetUrl: URL,
@@ -346,8 +345,6 @@ function shouldRetryMediaStatus(status: number): boolean {
   return [401, 403, 404, 410, 429, 500, 502, 503, 504].includes(status);
 }
 
-// ================= Allowlist =================
-
 function isPyazzOrigin(origin: string): boolean {
   return PYAZZ_ORIGINS.has(origin.toLowerCase());
 }
@@ -386,8 +383,6 @@ function isAllowedTarget(
   return false;
 }
 
-// ================= Cache helpers =================
-
 function cleanupCaches() {
   const now = Date.now();
 
@@ -417,8 +412,6 @@ function isDetailLikePage(url: URL): boolean {
     p.startsWith("/search")
   );
 }
-
-// ================= URL extraction =================
 
 function extractTargetUrl(req: Request, url: URL): string {
   if (url.pathname.startsWith(PROXY_PREFIX)) {
@@ -553,8 +546,6 @@ function extractRealTargetFromProxyUrl(
 
   return out;
 }
-
-// ================= Request / response =================
 
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
   const path = url.pathname.toLowerCase();
@@ -697,8 +688,6 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   return h;
 }
 
-// ================= Rewrite =================
-
 function rewriteHtml(
   html: string,
   baseUrl: string,
@@ -823,8 +812,6 @@ function toAbs(value: string, baseUrl: string): string | null {
   }
 }
 
-// ================= Injected script =================
-
 function injectedScript(
   proxyBase: string,
   targetOrigin: string,
@@ -833,6 +820,14 @@ function injectedScript(
   return `<script>
 (function(){
 'use strict';
+
+function shouldIgnoreDebugUrl(url){
+  try{
+    return /google-analytics\\.com|googletagmanager\\.com/i.test(url || '');
+  }catch(e){
+    return false;
+  }
+}
 
 function createDebugBox(){
   try{
@@ -885,6 +880,8 @@ function createDebugBox(){
 
 function reportFail(type, url, extra){
   try{
+    if (shouldIgnoreDebugUrl(url)) return;
+
     createDebugBox();
     var box = document.getElementById('__proxy_debug_box');
     var content = document.getElementById('__proxy_debug_content');
@@ -1295,8 +1292,6 @@ console.log('[Proxy] pyazz-only locked version active');
 })();
 <\/script>`;
 }
-
-// ================= Basic headers/pages =================
 
 function corsHeaders(): Headers {
   return new Headers({
