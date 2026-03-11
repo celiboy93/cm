@@ -1548,8 +1548,8 @@ function rewriteTree(root){
   if(!root) return;
 
   hideUnsupportedTabs(root);
+  hideHeaderBrand(root);
   patchVideoElements(root);
-  decoratePosterTitles(root);
 
   rewriteNode(root);
   try{
@@ -1560,6 +1560,7 @@ function rewriteTree(root){
   }catch(e){}
 
   hideUnsupportedTabs(root);
+  hideHeaderBrand(root);
   patchVideoElements(root);
   decoratePosterTitles(root);
 }
@@ -1588,27 +1589,28 @@ if(document.readyState === 'loading'){
   document.addEventListener('DOMContentLoaded', function(){
     persistTargetOrigin();
     hideUnsupportedTabs(document);
+    hideHeaderBrand(document);
     patchVideoElements(document);
-    decoratePosterTitles(document);
     rewriteTree(document.documentElement);
   });
 }else{
   persistTargetOrigin();
   hideUnsupportedTabs(document);
+  hideHeaderBrand(document);
   patchVideoElements(document);
-  decoratePosterTitles(document);
   rewriteTree(document.documentElement);
 }
 
 window.addEventListener('load', function(){
   persistTargetOrigin();
   hideUnsupportedTabs(document);
+  hideHeaderBrand(document);
   patchVideoElements(document);
-  decoratePosterTitles(document);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 100);
   setTimeout(function(){ rewriteTree(document.documentElement); }, 800);
   setTimeout(function(){
     hideUnsupportedTabs(document);
+    hideHeaderBrand(document);
     patchVideoElements(document);
     decoratePosterTitles(document);
   }, 1600);
