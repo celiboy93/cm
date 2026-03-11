@@ -3,12 +3,33 @@ const PORT = 8000;
 const PROXY_PREFIX = "/proxy/";
 const TARGET_COOKIE = "__proxy_target_origin";
 
+// ===== Short-lived caches =====
+const DETAIL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const MEDIA_RESOLVE_CACHE_TTL_MS = 30 * 1000; // 30 seconds
+
+type DetailCacheEntry = {
+  expiresAt: number;
+  status: number;
+  headers: [string, string][];
+  body: string;
+};
+
+type ResolveCacheEntry = {
+  expiresAt: number;
+  finalUrl: string;
+};
+
+const detailHtmlCache = new Map<string, DetailCacheEntry>();
+const mediaResolveCache = new Map<string, ResolveCacheEntry>();
+
 Deno.serve({ port: PORT }, handler);
 console.log(`Proxy running on http://localhost:${PORT}`);
 
 async function handler(req: Request): Promise<Response> {
   const reqUrl = new URL(req.url);
   const proxyOrigin = reqUrl.origin;
+
+  cleanupCaches();
 
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -55,13 +76,49 @@ async function handler(req: Request): Promise<Response> {
       );
     }
 
-    const upstreamHeaders = buildUpstreamHeaders(req, targetUrl);
+    const cookieOrigin = getCookie(req, TARGET_COOKIE) || targetUrl.origin;
     const isMedia = looksLikeMediaRequest(targetUrl, req);
+
+    // ===== HTML detail cache =====
+    if (req.method === "GET" && !isMedia && isDetailLikePage(targetUrl)) {
+      const cacheKey = makeDetailCacheKey(targetUrl.href, cookieOrigin);
+      const cached = detailHtmlCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        const h = new Headers(cached.headers);
+        h.set("content-type", "text/html; charset=utf-8");
+        h.set("x-proxy-cache", "HIT");
+        h.append(
+          "set-cookie",
+          `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
+        );
+        return new Response(cached.body, {
+          status: cached.status,
+          headers: h,
+        });
+      }
+    }
+
+    // ===== media resolve cache =====
+    let effectiveTargetUrl = targetUrl;
+    if (req.method === "GET" && isMedia) {
+      const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
+      const cachedResolve = mediaResolveCache.get(resolveKey);
+      if (cachedResolve && cachedResolve.expiresAt > Date.now()) {
+        try {
+          effectiveTargetUrl = new URL(cachedResolve.finalUrl);
+        } catch {
+          // ignore bad cache
+        }
+      }
+    }
+
+    const upstreamHeaders = buildUpstreamHeaders(req, effectiveTargetUrl);
+    const effectiveIsMedia = looksLikeMediaRequest(effectiveTargetUrl, req);
 
     const init: RequestInit = {
       method: req.method,
       headers: upstreamHeaders,
-      redirect: isMedia ? "follow" : "manual",
+      redirect: effectiveIsMedia ? "follow" : "manual",
     };
 
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -70,20 +127,30 @@ async function handler(req: Request): Promise<Response> {
       init.duplex = "half";
     }
 
-    const upstream = await fetch(targetUrl.href, init);
+    const upstream = await fetch(effectiveTargetUrl.href, init);
+
+    // save final media resolved URL
+    if (req.method === "GET" && effectiveIsMedia) {
+      const resolveKey = makeResolveCacheKey(targetUrl.href, cookieOrigin);
+      mediaResolveCache.set(resolveKey, {
+        expiresAt: Date.now() + MEDIA_RESOLVE_CACHE_TTL_MS,
+        finalUrl: upstream.url || effectiveTargetUrl.href,
+      });
+    }
+
     const contentType = upstream.headers.get("content-type") || "";
     const outHeaders = buildResponseHeaders(upstream, proxyOrigin);
 
-    if (!isMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
+    if (!effectiveIsMedia && [301, 302, 303, 307, 308].includes(upstream.status)) {
       const loc = upstream.headers.get("location");
       if (loc) {
-        const abs = new URL(loc, targetUrl.href).href;
+        const abs = new URL(loc, effectiveTargetUrl.href).href;
         outHeaders.set("location", proxyOrigin + PROXY_PREFIX + abs);
       }
 
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(null, {
@@ -96,9 +163,9 @@ async function handler(req: Request): Promise<Response> {
       let html = await upstream.text();
       html = rewriteHtml(
         html,
-        targetUrl.href,
+        effectiveTargetUrl.href,
         proxyOrigin + PROXY_PREFIX,
-        getCookie(req, TARGET_COOKIE) || targetUrl.origin,
+        cookieOrigin,
       );
 
       outHeaders.delete("content-length");
@@ -106,8 +173,20 @@ async function handler(req: Request): Promise<Response> {
       outHeaders.set("content-type", "text/html; charset=utf-8");
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
       );
+      outHeaders.set("x-proxy-cache", "MISS");
+
+      // cache detail-like html only
+      if (req.method === "GET" && !effectiveIsMedia && isDetailLikePage(effectiveTargetUrl)) {
+        const cacheKey = makeDetailCacheKey(effectiveTargetUrl.href, cookieOrigin);
+        detailHtmlCache.set(cacheKey, {
+          expiresAt: Date.now() + DETAIL_CACHE_TTL_MS,
+          status: upstream.status,
+          headers: [...outHeaders.entries()],
+          body: html,
+        });
+      }
 
       return new Response(html, {
         status: upstream.status,
@@ -117,7 +196,7 @@ async function handler(req: Request): Promise<Response> {
 
     if (contentType.includes("text/css")) {
       let css = await upstream.text();
-      css = rewriteCss(css, targetUrl.href, proxyOrigin + PROXY_PREFIX);
+      css = rewriteCss(css, effectiveTargetUrl.href, proxyOrigin + PROXY_PREFIX);
 
       outHeaders.delete("content-length");
       outHeaders.delete("content-encoding");
@@ -137,7 +216,7 @@ async function handler(req: Request): Promise<Response> {
     ) {
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(upstream.body, {
@@ -155,7 +234,7 @@ async function handler(req: Request): Promise<Response> {
       outHeaders.delete("content-encoding");
       outHeaders.append(
         "set-cookie",
-        `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
+        `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
       );
 
       return new Response(txt, {
@@ -166,7 +245,7 @@ async function handler(req: Request): Promise<Response> {
 
     outHeaders.append(
       "set-cookie",
-      `${TARGET_COOKIE}=${encodeURIComponent(getCookie(req, TARGET_COOKIE) || targetUrl.origin)}; Path=/; SameSite=Lax`,
+      `${TARGET_COOKIE}=${encodeURIComponent(cookieOrigin)}; Path=/; SameSite=Lax`,
     );
 
     return new Response(upstream.body, {
@@ -184,6 +263,40 @@ async function handler(req: Request): Promise<Response> {
     );
   }
 }
+
+// ================= Cache helpers =================
+
+function cleanupCaches() {
+  const now = Date.now();
+
+  for (const [k, v] of detailHtmlCache.entries()) {
+    if (v.expiresAt <= now) detailHtmlCache.delete(k);
+  }
+
+  for (const [k, v] of mediaResolveCache.entries()) {
+    if (v.expiresAt <= now) mediaResolveCache.delete(k);
+  }
+}
+
+function makeDetailCacheKey(url: string, origin: string): string {
+  return `${origin}::detail::${url}`;
+}
+
+function makeResolveCacheKey(url: string, origin: string): string {
+  return `${origin}::media::${url}`;
+}
+
+function isDetailLikePage(url: URL): boolean {
+  const p = url.pathname.toLowerCase();
+  return (
+    /^\/video\/[a-z0-9-]+(?:\/)?$/i.test(url.pathname) ||
+    p === "/" ||
+    p.startsWith("/movies") ||
+    p.startsWith("/search")
+  );
+}
+
+// ================= URL extraction =================
 
 function extractTargetUrl(req: Request, url: URL): string {
   if (url.pathname.startsWith(PROXY_PREFIX)) {
@@ -319,6 +432,8 @@ function extractRealTargetFromProxyUrl(
   return out;
 }
 
+// ================= Request / response =================
+
 function looksLikeMediaRequest(url: URL, req: Request): boolean {
   const path = url.pathname.toLowerCase();
   const host = url.hostname.toLowerCase();
@@ -448,6 +563,8 @@ function buildResponseHeaders(res: Response, proxyOrigin: string): Headers {
   return h;
 }
 
+// ================= Rewrite =================
+
 function rewriteHtml(
   html: string,
   baseUrl: string,
@@ -571,6 +688,8 @@ function toAbs(value: string, baseUrl: string): string | null {
     return null;
   }
 }
+
+// ================= Injected script =================
 
 function injectedScript(
   proxyBase: string,
@@ -910,10 +1029,12 @@ try{
   });
 }catch(e){}
 
-console.log('[Proxy] pyazz media-follow fix active');
+console.log('[Proxy] pyazz final cached version active');
 })();
 <\/script>`;
 }
+
+// ================= Basic headers/pages =================
 
 function corsHeaders(): Headers {
   return new Headers({
@@ -957,7 +1078,7 @@ small{display:block;margin-top:12px;color:#94a3b8}
 <body>
 <div class="box">
   <h1>Deno Proxy</h1>
-  <p>pyazz.com အတွက် detail + media follow fix ပါတဲ့ proxy</p>
+  <p>pyazz.com အတွက် detail + media + short cache ပါတဲ့ proxy</p>
   <form onsubmit="go(event)">
     <input id="u" type="text" placeholder="https://pyazz.com" required>
     <button type="submit">Browse</button>
